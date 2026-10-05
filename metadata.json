@@ -1,0 +1,6 @@
+{
+  "name": "IBR Ops",
+  "description": "Plataforma de operações, conhecimento, infraestrutura e inteligência técnica da IBR Cloud Services.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
