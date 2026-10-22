@@ -153,9 +153,15 @@ TS=$(date +%Y%m%d-%H%M%S)
 
 emit() { local o="" a; for a in "$@"; do a=${a//|//}; a=${a//$'\n'/ }; a=${a//$'\r'/}; o="$o|$a"; done; printf '%s\n' "${o#|}"; }
 
-if command -v dpkg-query >/dev/null 2>&1; then PM=apt
-elif command -v rpm >/dev/null 2>&1; then PM=rpm
-else PM=none; fi
+OSLIKE=$( . /etc/os-release 2>/dev/null; echo " ${ID:-} ${ID_LIKE:-} " )
+case "$OSLIKE" in
+  *" rhel "*|*" fedora "*|*" centos "*|*" almalinux "*|*" rocky "*|*" ol "*|*" amzn "*) PM=rpm ;;
+  *" debian "*|*" ubuntu "*) PM=apt ;;
+  *) if command -v rpm >/dev/null 2>&1 && ! command -v apt-get >/dev/null 2>&1; then PM=rpm
+     elif command -v dpkg-query >/dev/null 2>&1; then PM=apt
+     elif command -v rpm >/dev/null 2>&1; then PM=rpm
+     else PM=none; fi ;;
+esac
 
 # ---------- classificacao ----------
 vge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }
@@ -328,6 +334,7 @@ scan_ioc() {
     emit IOC_ROOT "$r" "arquivos_php_alterados_desde_${IBR_SINCE}=$total"
     while IFS='|' read -r dt usr sz path; do
       case "$path" in
+        */twig/*|*/templates_c/*|*/smarty/*|*/compiled/*|*/cache/*) tag=RECENT ;;
         */upload*/*|*/tmp/*|*/temp/*|*/files/*|*/images/*|*/img/*|*/media/*|*/sessions/*) tag=SUSPECT ;;
         *) tag=RECENT ;;
       esac
@@ -469,18 +476,17 @@ do_unmitigate() {
 PHP_REGEX_APT='^(php[0-9.]*(-.*)?|libapache2-mod-php[0-9.]*|libphp[0-9.]*(-.*)?)$'
 PHP_REGEX_RPM='^(php[0-9]*(-.*)?|.*-php(-.*)?|ea-php.*|alt-php.*)$'
 
-do_patch() {
-  local PRE POST pkgs held sim before_file units_before u rc=0 hb ha vuln_pk vuln_src still
+do_patch_inner() {
+  local PRE POST pkgs held sim before_file units_before u rc=0 hb ha vuln_pk still
   [ "$ROOT" = yes ] || { emit PATCH FAILED "requer root (sudo -n)"; return 1; }
   [ "$PM" != none ] || { emit PATCH FAILED "sem gerenciador de pacotes suportado (apt/rpm)"; return 1; }
   mkdir -p "$STATE"
   PRE=$(scan_bins before); echo "$PRE"
   vuln_pk=$(echo "$PRE" | awk -F'|' '$1=="BIN" && ($7=="VULNERABLE"||$7=="NEEDS_BACKPORT") && $5!="source"{print $5}' | sort -u)
-  vuln_src=$(echo "$PRE" | awk -F'|' '$1=="BIN" && ($7=="VULNERABLE"||$7=="NEEDS_BACKPORT") && $5=="source"{print $2}' | sort -u)
+  VULN_SRC=$(echo "$PRE" | awk -F'|' '$1=="BIN" && ($7=="VULNERABLE"||$7=="NEEDS_BACKPORT") && $5=="source"{print $2}' | sort -u)
   if [ -z "$vuln_pk" ]; then
-    if [ -n "$vuln_src" ]; then emit PATCH MANUAL "PHP vulneravel fora de pacote (build manual): $(echo $vuln_src | tr '\n' ' ')"
-    elif echo "$PRE" | awk -F'|' '$1=="BIN" && $7=="EOL_NO_FIX"' | grep -q .; then emit PATCH NOOP "EOL sem correcao: usar mitigate + isolamento + migracao"
-    else emit PATCH NOOP "nada vulneravel por pacote"; fi
+    if echo "$PRE" | awk -F'|' '$1=="BIN" && $7=="EOL_NO_FIX"' | grep -q .; then emit PATCH NOOP "EOL sem correcao: usar mitigate + isolamento + migracao"
+    elif [ -z "$VULN_SRC" ]; then emit PATCH NOOP "nada vulneravel por pacote"; fi
     return 0
   fi
   units_before=$(php_units; apache_unit)
@@ -527,6 +533,14 @@ do_patch() {
   if [ -n "$still" ]; then emit PATCH OK_STILL_VULNERABLE "versao instalada ainda sem correcao: $(echo $still | tr '\n' ' ')"
   else emit PATCH OK "http_antes=$hb http_depois=$ha"; fi
 }
+do_patch() {
+  VULN_SRC=""
+  do_patch_inner; local rc=$?
+  if [ -n "$VULN_SRC" ]; then
+    emit PATCH MANUAL "PHP fora de pacote (build manual ou CWP /opt/alt compilado) NAO foi atualizado: recompilar/atualizar pelo painel ou origem: $(echo $VULN_SRC | tr '\n' ' ' | cut -c1-200)"
+  fi
+  return $rc
+}
 patch_rollback() {
   case $PM in
     apt) DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y --allow-downgrades \
@@ -542,7 +556,7 @@ patch_rollback() {
 # ---------- main remoto ----------
 emit HOST "$(hostname -f 2>/dev/null || hostname)" "$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")" "$PM" "$ROOT" \
   "$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -Ev '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' | paste -sd, -)" \
-  "$(ss -ltn 2>/dev/null | awk 'NR>1{print $4}' | sed 's/.*://' | sort -un | grep -E '^(80|443|8080|8443)$' | paste -sd, -)"
+  "$(ss -ltn 2>/dev/null | awk 'NR>1{print $4}' | sed 's/.*://' | sort -un | grep -E '^(80|443|8080|8443|2030|2031|2082|2083|2086|2087|2222|10000|8083)$' | paste -sd, -)"
 case "$IBR_MODE" in
   discover)   scan_bins before; scan_containers; scan_ioc ;;
   mitigate)   do_mitigate ;;
@@ -779,14 +793,14 @@ fi
 
 # ---- relatorio ----
 SUMMARY="$OUT/summary.tsv"; IOCF="$OUT/ioc.txt"
-printf 'HOST\tIP\tACESSO\tIP_PUBLICO\tPORTAS_WEB\tPHP_SERVINDO\tSTATUS_CVE\tSTALE\tIOC_ARQ_SUSPEITOS\tIOC_CRASHES\tIOC_PROCS\tMITIGACAO\tPATCH\n' > "$SUMMARY"
+printf 'HOST\tIP\tACESSO\tIP_PUBLICO\tPORTAS_WEB\tPHP_SERVINDO\tSTATUS_CVE\tSTALE\tIOC_ARQ_SUSPEITOS\tIOC_BIN_SUSPEITOS\tIOC_CRASHES\tIOC_PROCS\tMITIGACAO\tPATCH\n' > "$SUMMARY"
 : > "$IOCF"
 for h in "${HOSTS[@]}"; do
   IFS='|' read -r name ip port flag note alias <<<"$h"
   raw="$OUT/raw/$name.txt"; acc="SEM_ARQUIVO"
   [ -f "$OUT/raw/$name.access" ] && acc=$(cut -d'|' -f1-3 "$OUT/raw/$name.access" | tr -cd '[:print:]' | tr '| ' ':_' | cut -c1-48)
   if [ "${acc%%:*}" != OK ]; then
-    printf '%s\t%s\t%s\t-\t-\t-\tSEM_ACESSO\t-\t-\t-\t-\t-\t-\n' "$name" "$ip" "$acc" >> "$SUMMARY"; continue
+    printf '%s\t%s\t%s\t-\t-\t-\tSEM_ACESSO\t-\t-\t-\t-\t-\t-\t-\n' "$name" "$ip" "$acc" >> "$SUMMARY"; continue
   fi
   awk -F'|' -v n="$name" -v ip="$ip" -v acc="$acc" '
     function rk(s){ if(s=="VULNERABLE"||s=="EOL_NO_FIX")return 6; if(s=="NEEDS_BACKPORT")return 5; if(s ~ /^UNKNOWN/)return 4; if(s ~ /^FIXED/)return 1; return 3 }
@@ -807,8 +821,8 @@ for h in "${HOSTS[@]}"; do
     $1=="PATCH"&&$2!="INFO"&&$2!="WARN"{pat=$2}
     END{
       if(na==0) status="NO_PHP"; else if(ns>0) status=wsl; else status=wal "(nao_servindo)";
-      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n", n, ip, acc, (pub==""?"nao":pub), (ports==""?"-":ports),
-             (vers==""?"-":vers), status, stale, isf+ibp, crash+0, iproc+0, (mit==""?"-":mit), (pat==""?"-":pat)
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", n, ip, acc, (pub==""?"nao":pub), (ports==""?"-":ports),
+             (vers==""?"-":vers), status, stale, isf+0, ibp+0, crash+0, iproc+0, (mit==""?"-":mit), (pat==""?"-":pat)
     }' "$raw" >> "$SUMMARY"
   grep -E '^(IOC_|STALE\||ERR\|)' "$raw" | sed "s/^/$name|/" >> "$IOCF"
 done
@@ -817,7 +831,7 @@ echo
 if command -v column >/dev/null 2>&1; then column -t -s$'\t' "$SUMMARY"; else cat "$SUMMARY"; fi
 echo
 n_vuln=$(awk -F'\t' 'NR>1 && ($7 ~ /^(VULNERABLE|EOL_NO_FIX|NEEDS_BACKPORT)/){c++} END{print c+0}' "$SUMMARY")
-n_ioc=$(awk -F'\t' 'NR>1 && ($9>0 || $11>0){c++} END{print c+0}' "$SUMMARY")
+n_ioc=$(awk -F'\t' 'NR>1 && ($9>0 || $10>0 || $12>0){c++} END{print c+0}' "$SUMMARY")
 n_fail=$(awk -F'\t' 'NR>1 && $7=="SEM_ACESSO"{c++} END{print c+0}' "$SUMMARY")
 n_stale=$(awk -F'\t' 'NR>1 && $8>0{c++} END{print c+0}' "$SUMMARY")
 log "RESUMO: vulneraveis/EOL=$n_vuln | stale=$n_stale | com IOC=$n_ioc | sem acesso=$n_fail | de ${#HOSTS[@]} hosts"
