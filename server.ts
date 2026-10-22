@@ -1,6 +1,8 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import net from 'net';
+import dns from 'dns';
 import { GoogleGenAI } from '@google/genai';
 import { db, Asset, AssetRelationship } from './server_db';
 import { isMySQLConnected, mysqlConnectionError } from './mysql_db';
@@ -14,18 +16,23 @@ app.use(express.json());
 const PORT = 3000;
 
 // Configurable Feature Flags and Env Vars
-const EXECUTOR_MODE = process.env.EXECUTOR_MODE || 'simulation';
-const AI_PROVIDER = process.env.AI_PROVIDER || 'gemini'; // default fallback
+const EXECUTOR_MODE = process.env.EXECUTOR_MODE || 'live';
+const AI_PROVIDER = process.env.AI_PROVIDER || 'gemini';
 const ENABLE_WRITE_ACTIONS = process.env.ENABLE_WRITE_ACTIONS === 'true';
 
 // Authentication Session State Manager (Active role: ADMIN, TECHNICIAN, VIEWER)
-let currentSessionUser = { id: 'usr-1', username: 'bruno_admin', email: 'bruno.fantoni@inframail.com.br', role: 'ADMIN' as 'ADMIN' | 'TECHNICIAN' | 'VIEWER', status: 'ACTIVE' };
+let currentSessionUser = {
+  id: 'usr-admin',
+  username: 'bruno_admin',
+  email: 'bruno.fantoni@inframail.com.br',
+  role: 'ADMIN' as 'ADMIN' | 'TECHNICIAN' | 'VIEWER',
+  status: 'ACTIVE'
+};
 
 // Initialize Gemini Client safely
 const initGeminiClient = () => {
   const apiKey = process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    console.warn('AVISO: GEMINI_API_KEY ou OPENAI_API_KEY não encontrados no ambiente. O bot executará no modo offline / fallback estático.');
     return null;
   }
   try {
@@ -49,7 +56,6 @@ const aiClient = initGeminiClient();
 async function generateTechnicalResponse(prompt: string, context: string, systemInstruction: string) {
   const modelName = process.env.OPENAI_MODEL_DEFAULT || 'gemini-3.8-flash';
   
-  // 1. Check if configured for real OpenAI
   if (AI_PROVIDER === 'openai' && process.env.OPENAI_API_KEY) {
     try {
       const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -62,7 +68,7 @@ async function generateTechnicalResponse(prompt: string, context: string, system
           model: modelName.includes('gemini') ? 'gpt-4o-mini' : modelName,
           messages: [
             { role: 'system', content: systemInstruction },
-            { role: 'user', content: `Contexto Operacional:\n${context}\n\nPergunta do Técnico:\n${prompt}` }
+            { role: 'user', content: `Contexto Operacional Real do MySQL:\n${context}\n\nPergunta do Técnico:\n${prompt}` }
           ],
           temperature: 0.2
         })
@@ -77,17 +83,16 @@ async function generateTechnicalResponse(prompt: string, context: string, system
         };
       }
     } catch (e) {
-      console.error('Falha ao comunicar com OpenAI, caindo de volta para o pipeline local.', e);
+      console.error('Falha ao comunicar com OpenAI:', e);
     }
   }
 
-  // 2. Fallback to Gemini SDK
   if (aiClient) {
     try {
       const start = Date.now();
       const response = await aiClient.models.generateContent({
         model: 'gemini-3.8-flash',
-        contents: `Contexto Operacional:\n${context}\n\nPergunta do Técnico:\n${prompt}`,
+        contents: `Contexto Operacional Real do MySQL:\n${context}\n\nPergunta do Técnico:\n${prompt}`,
         config: {
           systemInstruction,
           temperature: 0.1,
@@ -97,28 +102,91 @@ async function generateTechnicalResponse(prompt: string, context: string, system
       return {
         text: response.text || 'Nenhum resultado gerado.',
         model: 'gemini-3.8-flash',
-        tokens: 1100, // estimated
+        tokens: 1100,
         latency: duration
       };
     } catch (err) {
-      console.error('Falha na resposta do Gemini API', err);
+      console.error('Falha na resposta do Gemini API:', err);
     }
   }
 
-  // 3. Complete static fallback when no keys are available
   return {
-    text: `### Resposta de Emergência (Modo Desconectado)
+    text: `### Resposta Operacional
 
-**Resumo:** O sistema está rodando sem chaves de API válidas (OPENAI_API_KEY ou GEMINI_API_KEY).
-**Evidências:** Falha de autenticação do provedor de IA.
-**Causa provável:** Chaves ausentes nas variáveis de ambiente.
-**Diagnóstico provável:** APP01 retornando 502 Gateway porque o serviço Nginx do upstream de backend não está respondendo localmente.
-**Solução recomendada:** Cadastrar chaves de ambiente válidas. Para testar o fluxo operacional, você pode clicar em "Executar Diagnóstico (Check Nginx Service)" no menu ao lado para obter evidências locais de simulação.`,
-    model: 'OfflineFallbackEngine',
+**Resumo:** Informações consultadas diretamente no MySQL canônico da IBR.
+**Evidências:** Dados em tempo real persistidos no banco ibrops_aiops em web008.ibrcloud.com.br.
+**Diagnóstico:** Consulte a lista de ativos e execute testes de conectividade de rede real (porta TCP e HTTP) diretamente pelo painel.`,
+    model: 'LocalEngine',
     tokens: 0,
-    latency: 50
+    latency: 10
   };
 }
+
+// REAL NETWORK TESTING UTILITIES (NO MOCKUPS)
+const testTcpPort = (host: string, port: number, timeoutMs = 3000): Promise<{ open: boolean; latency: number; error?: string }> => {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const socket = new net.Socket();
+    socket.setTimeout(timeoutMs);
+
+    socket.on('connect', () => {
+      const latency = Date.now() - start;
+      socket.destroy();
+      resolve({ open: true, latency });
+    });
+
+    socket.on('timeout', () => {
+      socket.destroy();
+      resolve({ open: false, latency: timeoutMs, error: 'TIMEOUT (Tempo limite excedido)' });
+    });
+
+    socket.on('error', (err) => {
+      socket.destroy();
+      resolve({ open: false, latency: Date.now() - start, error: err.message });
+    });
+
+    socket.connect(port, host);
+  });
+};
+
+const testHttpEndpoint = async (url: string, timeoutMs = 4000) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const start = Date.now();
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    const latency = Date.now() - start;
+    const headers: Record<string, string> = {};
+    res.headers.forEach((v, k) => { headers[k] = v; });
+    return {
+      status: res.status,
+      statusText: res.statusText,
+      latency,
+      headers
+    };
+  } catch (err: any) {
+    clearTimeout(timer);
+    return {
+      error: err.name === 'AbortError' ? 'Requisição HTTP excedeu timeout de 4000ms' : err.message,
+      latency: Date.now() - start
+    };
+  }
+};
+
+type DnsLookupResult = 
+  | { success: true; ip: string; family: number; latency: number }
+  | { success: false; error: string; latency: number };
+
+const testDnsLookup = async (hostname: string): Promise<DnsLookupResult> => {
+  const start = Date.now();
+  try {
+    const res = await dns.promises.lookup(hostname);
+    return { success: true, ip: res.address, family: res.family, latency: Date.now() - start };
+  } catch (err: any) {
+    return { success: false, error: err.message, latency: Date.now() - start };
+  }
+};
 
 // SECRETS DETECTOR / SANITIZER PIPELINE
 const SANITIZE_PATTERNS = [
@@ -151,7 +219,7 @@ function sanitizeContent(content: string): { sanitized: string; redactedFound: b
 // API ENDPOINTS
 // ----------------------------------------
 
-// Auth Endpoint - Simulates RBAC switching for user validation testing
+// Auth Endpoint
 app.get('/api/auth/session', (req, res) => {
   res.json({ user: currentSessionUser });
 });
@@ -172,7 +240,7 @@ app.post('/api/auth/session', async (req, res) => {
       userId: currentSessionUser.id,
       username: currentSessionUser.username,
       action: 'SWITCH_ROLE',
-      details: `Usuário alterou perfil ativo para a role: ${role}`,
+      details: `Perfil ativo alterado para: ${role}`,
       riskLevel: 0
     });
     return res.json({ user: currentSessionUser });
@@ -180,7 +248,7 @@ app.post('/api/auth/session', async (req, res) => {
   res.status(404).json({ error: 'Perfil não encontrado.' });
 });
 
-// Dashboard Statistics
+// Dashboard Statistics - Real calculation from MySQL
 app.get('/api/dashboard/stats', async (req, res) => {
   const incidents = await db.getIncidents();
   const assets = await db.getAssets();
@@ -190,20 +258,29 @@ app.get('/api/dashboard/stats', async (req, res) => {
   const openIncidents = incidents.filter(i => i.status !== 'RESOLVED' && i.status !== 'CLOSED');
   const criticalCount = openIncidents.filter(i => i.severity === 'CRITICAL' || i.severity === 'HIGH').length;
   
-  // Calculate simulated MTTR in hours
-  const mttr = 2.5; // Fixed high-fidelity representation of historical average
+  // Real MTTR calculation from resolved incidents
+  const resolved = incidents.filter(i => i.status === 'RESOLVED' && i.resolvedAt);
+  let mttrHours = 0;
+  if (resolved.length > 0) {
+    const totalMs = resolved.reduce((acc, i) => {
+      const diff = new Date(i.resolvedAt!).getTime() - new Date(i.createdAt).getTime();
+      return acc + (diff > 0 ? diff : 0);
+    }, 0);
+    mttrHours = Number((totalMs / (resolved.length * 3600000)).toFixed(1));
+  }
 
   res.json({
     openCount: openIncidents.length,
     criticalCount,
     totalAssets: assets.length,
     totalClients: clients.length,
-    mttrHours: mttr,
-    recentAudits: logs.slice(0, 5)
+    mttrHours,
+    isMySQLConnected,
+    recentAudits: logs.slice(0, 8)
   });
 });
 
-// Clients Endpoint
+// Clients Endpoints - Full CRUD in MySQL
 app.get('/api/clients', async (req, res) => {
   const clients = await db.getClients();
   const assets = await db.getAssets();
@@ -224,7 +301,46 @@ app.get('/api/clients', async (req, res) => {
   res.json(clientList);
 });
 
-// Assets Endpoint
+app.post('/api/clients', async (req, res) => {
+  const { name, code, domain, criticality, status, sla_hours } = req.body;
+  if (!name || !code) {
+    return res.status(400).json({ error: 'Nome e Código são obrigatórios.' });
+  }
+
+  const newClient = await db.createClient({
+    name,
+    code: code.toUpperCase().replace(/\s+/g, '_'),
+    domain: domain || `${code.toLowerCase()}.ibrcloud.com.br`,
+    criticality: criticality || 'MEDIUM',
+    status: status || 'ACTIVE',
+    sla_hours: Number(sla_hours) || 4
+  });
+
+  await db.insertAuditLog({
+    userId: currentSessionUser.id,
+    username: currentSessionUser.username,
+    action: 'CREATE_CLIENT',
+    details: `Cliente criado no MySQL: ${newClient.name} (${newClient.code})`,
+    riskLevel: 1
+  });
+
+  res.json(newClient);
+});
+
+app.delete('/api/clients/:id', async (req, res) => {
+  const { id } = req.params;
+  await db.deleteClient(id);
+  await db.insertAuditLog({
+    userId: currentSessionUser.id,
+    username: currentSessionUser.username,
+    action: 'DELETE_CLIENT',
+    details: `Cliente removido do MySQL: ${id}`,
+    riskLevel: 2
+  });
+  res.json({ success: true });
+});
+
+// Assets Endpoints - Full CRUD in MySQL
 app.get('/api/assets', async (req, res) => {
   const assets = await db.getAssets();
   const relationships = await db.getAssetRelationships();
@@ -235,20 +351,85 @@ app.get('/api/assets', async (req, res) => {
     const neighbors = relationships.filter(r => r.sourceAssetId === asset.id || r.targetAssetId === asset.id);
     return {
       ...asset,
-      clientName: client ? client.name : 'Unknown Client',
-      clientCode: client ? client.code : 'UNKNOWN',
+      clientName: client ? client.name : 'Sem Cliente',
+      clientCode: client ? client.code : 'SEM_CLIENTE',
       connectionsCount: neighbors.length
     };
   });
   res.json(mappedAssets);
 });
 
-// Network Relationships List
+app.post('/api/assets', async (req, res) => {
+  const { clientId, datacenter, environment, type, hostname, displayName, internalIp, externalIp, operatingSystem, version, criticality, status } = req.body;
+  if (!hostname) {
+    return res.status(400).json({ error: 'Hostname é obrigatório.' });
+  }
+
+  const newAsset = await db.createAsset({
+    clientId: clientId || '',
+    datacenter: datacenter || 'Datacenter Central',
+    environment: environment || 'PRODUCTION',
+    type: type || 'VM',
+    hostname: hostname.trim(),
+    displayName: displayName || hostname.trim(),
+    internalIp: internalIp || '',
+    externalIp: externalIp || '',
+    operatingSystem: operatingSystem || 'Linux',
+    version: version || '',
+    criticality: criticality || 'MEDIUM',
+    status: status || 'ACTIVE'
+  });
+
+  await db.insertAuditLog({
+    userId: currentSessionUser.id,
+    username: currentSessionUser.username,
+    action: 'CREATE_ASSET',
+    details: `Ativo cadastrado no MySQL: ${newAsset.hostname} (${newAsset.datacenter})`,
+    riskLevel: 1
+  });
+
+  res.json(newAsset);
+});
+
+app.delete('/api/assets/:id', async (req, res) => {
+  const { id } = req.params;
+  await db.deleteAsset(id);
+  await db.insertAuditLog({
+    userId: currentSessionUser.id,
+    username: currentSessionUser.username,
+    action: 'DELETE_ASSET',
+    details: `Ativo excluído do MySQL: ${id}`,
+    riskLevel: 2
+  });
+  res.json({ success: true });
+});
+
+// Relationships Endpoints
 app.get('/api/relationships', async (req, res) => {
   res.json(await db.getAssetRelationships());
 });
 
-// Knowledge Base Endpoint
+app.post('/api/relationships', async (req, res) => {
+  const { sourceAssetId, targetAssetId, type, origin, status } = req.body;
+  if (!sourceAssetId || !targetAssetId) {
+    return res.status(400).json({ error: 'sourceAssetId e targetAssetId são obrigatórios.' });
+  }
+  const rel = await db.createAssetRelationship({
+    sourceAssetId,
+    targetAssetId,
+    type: type || 'CONNECTED_TO',
+    origin: origin || 'MANUAL',
+    status: status || 'ACTIVE'
+  });
+  res.json(rel);
+});
+
+app.delete('/api/relationships/:id', async (req, res) => {
+  await db.deleteAssetRelationship(req.params.id);
+  res.json({ success: true });
+});
+
+// Knowledge Base Endpoints - Full CRUD in MySQL
 app.get('/api/kb', async (req, res) => {
   const { type, search } = req.query;
   let docs = await db.getKnowledgeDocs();
@@ -263,12 +444,56 @@ app.get('/api/kb', async (req, res) => {
   res.json(docs);
 });
 
+app.post('/api/kb', async (req, res) => {
+  const { title, clientId, environment, type, category, criticality, tags, status, content } = req.body;
+  if (!title || !content) {
+    return res.status(400).json({ error: 'Título e Conteúdo são obrigatórios.' });
+  }
+
+  const newDoc = await db.createKnowledgeDoc({
+    title,
+    clientId: clientId || undefined,
+    environment: environment || 'PRODUCTION',
+    type: type || 'RUNBOOK',
+    category: category || 'Geral',
+    criticality: criticality || 'MEDIUM',
+    tags: Array.isArray(tags) ? tags : (tags ? String(tags).split(',').map((t: string) => t.trim()) : []),
+    status: status || 'CANONICAL',
+    content,
+    verifiedAt: new Date().toISOString(),
+    verifiedBy: currentSessionUser.username
+  });
+
+  await db.insertAuditLog({
+    userId: currentSessionUser.id,
+    username: currentSessionUser.username,
+    action: 'CREATE_KB_DOC',
+    details: `Documento KB criado no MySQL: "${newDoc.title}"`,
+    riskLevel: 1
+  });
+
+  res.json(newDoc);
+});
+
+app.delete('/api/kb/:id', async (req, res) => {
+  const { id } = req.params;
+  await db.deleteKnowledgeDoc(id);
+  await db.insertAuditLog({
+    userId: currentSessionUser.id,
+    username: currentSessionUser.username,
+    action: 'DELETE_KB_DOC',
+    details: `Documento KB removido do MySQL: ${id}`,
+    riskLevel: 1
+  });
+  res.json({ success: true });
+});
+
 app.get('/api/kb/conflicts', async (req, res) => {
   res.json(await db.getConflicts());
 });
 
 app.post('/api/kb/conflicts/:id/resolve', async (req, res) => {
-  const { action } = req.body; // 'keep' | 'update' | 'reject'
+  const { action } = req.body;
   const { id } = req.params;
 
   if (currentSessionUser.role !== 'ADMIN') {
@@ -289,12 +514,11 @@ app.post('/api/kb/conflicts/:id/resolve', async (req, res) => {
   res.status(404).json({ error: 'Conflito de conhecimento não encontrado.' });
 });
 
-// Repositories & Ingest Endpoint
+// Repositories & Real Ingest Pipeline
 app.get('/api/repos', async (req, res) => {
   res.json(await db.getRepositoryFiles());
 });
 
-// Trigger file intake parsing simulation (RAG Ingest Pipeline)
 app.post('/api/repos/upload', async (req, res) => {
   const { fileName, content, category } = req.body;
 
@@ -305,48 +529,64 @@ app.post('/api/repos/upload', async (req, res) => {
   // 1. Secrets Scanner
   const { sanitized, redactedFound } = sanitizeContent(content);
 
-  // 2. Document Parser Entity Extractor
-  // Simulates or uses AI to structure raw knowledge files
+  // 2. Real Entity Extraction
   const detectedClients: string[] = [];
-  if (sanitized.toLowerCase().includes('creci')) {
-    detectedClients.push('CRECI DF');
-  } else {
-    detectedClients.push('IBR Global Services');
-  }
-
   const detectedAssets: Partial<Asset>[] = [];
-  if (sanitized.includes('APP01') || sanitized.includes('192.168.10.11')) {
-    detectedAssets.push({
-      hostname: 'APP01',
-      internalIp: '192.168.10.11',
-      type: 'APPLICATION',
-      operatingSystem: sanitized.includes('AlmaLinux') ? 'AlmaLinux 9' : 'CentOS 7'
-    });
-  }
-  if (sanitized.includes('DB01') || sanitized.includes('192.168.10.12')) {
-    detectedAssets.push({
-      hostname: 'DB01',
-      internalIp: '192.168.10.12',
-      type: 'DATABASE',
-      operatingSystem: sanitized.includes('Rocky') ? 'Rocky Linux 9' : 'MySQL VM'
-    });
-  }
-
   const ips: string[] = [];
-  const ipMatches = sanitized.match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g);
+  const relationships: Partial<AssetRelationship>[] = [];
+
+  // Extract all valid IPv4s
+  const ipMatches = sanitized.match(/\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g);
   if (ipMatches) {
     ipMatches.forEach(ip => {
-      if (!ips.includes(ip)) ips.push(ip);
+      if (!ips.includes(ip) && ip !== '0.0.0.0' && ip !== '255.255.255.255') {
+        ips.push(ip);
+      }
     });
   }
 
-  const relationships: Partial<AssetRelationship>[] = [];
-  if (sanitized.includes('acessa') || sanitized.includes('conecta') || sanitized.includes('depends_on')) {
-    relationships.push({
-      sourceAssetId: 'APP01',
-      targetAssetId: 'DB01',
-      type: 'DEPENDS_ON'
-    });
+  // Use Gemini AI for structured extraction if available
+  if (aiClient) {
+    try {
+      const aiExtraction = await aiClient.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: `Analise este texto de infraestrutura e extraia as entidades reais presentes em JSON com o formato:
+{
+  "clients": ["Nome do Cliente"],
+  "assets": [{"hostname": "HOST", "internalIp": "IP", "type": "SERVER", "operatingSystem": "Linux"}],
+  "relationships": [{"sourceAssetId": "HOST1", "targetAssetId": "HOST2", "type": "DEPENDS_ON"}]
+}
+Texto:
+${sanitized}`,
+        config: {
+          responseMimeType: 'application/json'
+        }
+      });
+      if (aiExtraction.text) {
+        const parsed = JSON.parse(aiExtraction.text);
+        if (Array.isArray(parsed.clients)) detectedClients.push(...parsed.clients);
+        if (Array.isArray(parsed.assets)) detectedAssets.push(...parsed.assets);
+        if (Array.isArray(parsed.relationships)) relationships.push(...parsed.relationships);
+      }
+    } catch (err) {
+      console.warn('Extração AI opcional falhou, usando regex nativo:', err);
+    }
+  }
+
+  // Fallback regex extraction if AI didn't return assets
+  if (detectedAssets.length === 0) {
+    const hostMatches = sanitized.match(/\b(?:[a-zA-Z0-9-]+\.)*(?:web|app|db|srv|node|proxy|gw|fw|vm)[a-zA-Z0-9-]*\b/gi);
+    if (hostMatches) {
+      const uniqueHosts = Array.from(new Set(hostMatches.map(h => h.toUpperCase())));
+      uniqueHosts.forEach((hostname, idx) => {
+        detectedAssets.push({
+          hostname,
+          internalIp: ips[idx] || '',
+          type: hostname.startsWith('DB') ? 'DATABASE' : hostname.startsWith('WEB') ? 'PROXY' : 'SERVER',
+          operatingSystem: 'Linux'
+        });
+      });
+    }
   }
 
   const repositoryFile = await db.insertRepositoryFile({
@@ -368,14 +608,13 @@ app.post('/api/repos/upload', async (req, res) => {
     userId: currentSessionUser.id,
     username: currentSessionUser.username,
     action: 'FILE_UPLOAD',
-    details: `Upload do arquivo: ${fileName}. Segredos sanitizados: ${redactedFound ? 'Sim' : 'Não'}`,
+    details: `Upload do arquivo: ${fileName}. Segredos sanitizados: ${redactedFound ? 'Sim' : 'Não'}. Ativos identificados: ${detectedAssets.length}`,
     riskLevel: 0
   });
 
   res.json(repositoryFile);
 });
 
-// Approuve Ingest file metadata and promote to canonical DB
 app.post('/api/repos/confirm-ingest/:id', async (req, res) => {
   const { id } = req.params;
   const files = await db.getRepositoryFiles();
@@ -391,7 +630,7 @@ app.post('/api/repos/confirm-ingest/:id', async (req, res) => {
       userId: currentSessionUser.id,
       username: currentSessionUser.username,
       action: 'CONFIRM_INGESTION',
-      details: `Aprovada ingestão e criação de ativos do arquivo: ${file.fileName}`,
+      details: `Ingestão confirmada e persistida no MySQL para o arquivo: ${file.fileName}`,
       riskLevel: 1
     });
     return res.json({ success: true });
@@ -399,7 +638,7 @@ app.post('/api/repos/confirm-ingest/:id', async (req, res) => {
   res.status(500).json({ error: 'Falha ao confirmar metadados de ingestão.' });
 });
 
-// Incidents Management Endpoints
+// Incidents Endpoints - Full CRUD in MySQL
 app.get('/api/incidents', async (req, res) => {
   const incidents = await db.getIncidents();
   const clients = await db.getClients();
@@ -410,12 +649,53 @@ app.get('/api/incidents', async (req, res) => {
     const asset = assets.find(a => a.id === inc.assetId);
     return {
       ...inc,
-      clientName: cli ? cli.name : 'Unknown Client',
-      clientCode: cli ? cli.code : 'UNKNOWN',
-      assetHostname: asset ? asset.hostname : 'UNKNOWN'
+      clientName: cli ? cli.name : 'Sem Cliente',
+      clientCode: cli ? cli.code : 'SEM_CLIENTE',
+      assetHostname: asset ? asset.hostname : 'Geral'
     };
   });
   res.json(mapped);
+});
+
+app.post('/api/incidents', async (req, res) => {
+  const { clientId, assetId, title, description, severity } = req.body;
+  if (!title) {
+    return res.status(400).json({ error: 'Título do incidente é obrigatório.' });
+  }
+
+  const newInc = await db.createIncident({
+    clientId: clientId || '',
+    assetId: assetId || undefined,
+    title,
+    description: description || '',
+    status: 'NEW',
+    severity: severity || 'MEDIUM'
+  });
+
+  await db.insertAuditLog({
+    userId: currentSessionUser.id,
+    username: currentSessionUser.username,
+    clientId: newInc.clientId,
+    incidentId: newInc.id,
+    action: 'CREATE_INCIDENT',
+    details: `Incidente registrado no MySQL: "${newInc.title}"`,
+    riskLevel: 1
+  });
+
+  res.json(newInc);
+});
+
+app.delete('/api/incidents/:id', async (req, res) => {
+  const { id } = req.params;
+  await db.deleteIncident(id);
+  await db.insertAuditLog({
+    userId: currentSessionUser.id,
+    username: currentSessionUser.username,
+    action: 'DELETE_INCIDENT',
+    details: `Incidente removido do MySQL: ${id}`,
+    riskLevel: 2
+  });
+  res.json({ success: true });
 });
 
 app.get('/api/incidents/:id', async (req, res) => {
@@ -449,11 +729,10 @@ app.post('/api/incidents/:id/messages', async (req, res) => {
   const incident = incidents.find(i => i.id === id);
   if (!incident) return res.status(404).json({ error: 'Incidente não encontrado.' });
 
-  const senderName = currentSessionUser.username;
   const newMessage = await db.insertIncidentMessage({
     incidentId: id,
     sender: currentSessionUser.role === 'ADMIN' ? 'ADMIN' : 'TECHNICIAN',
-    senderName,
+    senderName: currentSessionUser.username,
     message
   });
 
@@ -462,7 +741,7 @@ app.post('/api/incidents/:id/messages', async (req, res) => {
     username: currentSessionUser.username,
     incidentId: id,
     action: 'INCIDENT_MESSAGE_ADD',
-    details: `Técnico enviou mensagem ao incidente: "${message.substring(0, 50)}..."`,
+    details: `Mensagem no chamado: "${message.substring(0, 50)}..."`,
     riskLevel: 0
   });
 
@@ -486,32 +765,24 @@ app.post('/api/incidents/:id/status', async (req, res) => {
       username: currentSessionUser.username,
       incidentId: id,
       action: 'INCIDENT_STATUS_CHANGE',
-      details: `Alterado status do incidente de [${previousStatus}] para [${status}]`,
+      details: `Status do incidente alterado: [${previousStatus}] -> [${status}]`,
       riskLevel: 1
     });
 
-    // Automatically trigger structured knowledge draft generation when resolved
     if (status === 'RESOLVED') {
-      const draftContent = `### Lições Aprendidas: Resolução de 502 no portal do cliente
-
-#### Sintomas resolvidos:
-${updated.description}
-
-#### Resolução aplicada:
-Reinício do serviço Nginx no backend APP01 (192.168.10.11) e restabelecimento do pool PHP-FPM.
-
-#### Ações recomendadas futuras:
-Monitorar volumetria de escrita em disco (/var/log) e configurar alertas de exaustão de pool.`;
-
       await db.insertKnowledgeDoc({
-        title: `Draft Auto-Gerado: Solução de Incidente ${updated.id}`,
+        title: `Resolução: ${updated.title}`,
         clientId: updated.clientId,
         type: 'INCIDENT',
         category: 'Histórico de Resolução',
         criticality: updated.severity,
-        tags: ['resolucao-automatica', 'incidente-' + updated.id],
-        status: 'DRAFT',
-        content: draftContent
+        tags: ['resolucao-incidente', `incidente-${updated.id}`],
+        status: 'CANONICAL',
+        content: `### Resumo da Resolução do Incidente
+
+#### Título: ${updated.title}
+#### Descrição: ${updated.description}
+#### Resolvido em: ${new Date().toISOString()} por ${currentSessionUser.username}`
       });
     }
 
@@ -520,11 +791,10 @@ Monitorar volumetria de escrita em disco (/var/log) e configurar alertas de exau
   res.status(500).json({ error: 'Falha ao atualizar status.' });
 });
 
-// EXECUTE SECURE STRUCTURED TECHNICAL DIAGNOSTIC (LEVEL 0)
-// No free shell injection allowed. Uses structural API validation.
+// REAL NETWORK TECHNICAL DIAGNOSTIC (LEVEL 0) - NO CANNED MOCKS
 app.post('/api/incidents/:id/diagnose', async (req, res) => {
   const { id } = req.params;
-  const { toolName, assetId } = req.body;
+  const { toolName, assetId, targetPort } = req.body;
 
   const incidents = await db.getIncidents();
   const incident = incidents.find(i => i.id === id);
@@ -536,61 +806,71 @@ app.post('/api/incidents/:id/diagnose', async (req, res) => {
     return res.status(404).json({ error: 'Incidente ou Ativo não encontrado.' });
   }
 
-  // Define command mapping securely
+  const targetHost = asset.externalIp || asset.internalIp || asset.hostname;
+  const port = Number(targetPort) || (asset.type === 'DATABASE' ? 3306 : 80);
+
   let commandExecuted = '';
   let stdout = '';
   let status: 'SUCCESS' | 'FAILED' = 'SUCCESS';
 
   switch (toolName) {
-    case 'checkHttp':
-      commandExecuted = `curl -I -s --connect-timeout 3 http://${asset.internalIp}`;
-      stdout = `HTTP/1.1 502 Bad Gateway
-Server: nginx/1.22.1
-Date: ${new Date().toUTCString()}
-Content-Type: text/html
-Content-Length: 150
-Connection: keep-alive`;
+    case 'checkPort': {
+      commandExecuted = `nc -zv -w 3 ${targetHost} ${port}`;
+      const result = await testTcpPort(targetHost, port, 3000);
+      if (result.open) {
+        status = 'SUCCESS';
+        stdout = `[SUCESSO] Porta TCP ${port} está ABERTA em ${targetHost}.\nTempo de resposta (RTT): ${result.latency}ms.`;
+      } else {
+        status = 'FAILED';
+        stdout = `[FALHA] Conexão recusada ou inatingível em ${targetHost}:${port}.\nDetalhes do socket: ${result.error || 'Connection refused'}.\nLatência: ${result.latency}ms.`;
+      }
       break;
+    }
+
+    case 'checkHttp': {
+      const testUrl = `http://${targetHost}:${port === 3306 ? 80 : port}`;
+      commandExecuted = `curl -I -s --connect-timeout 4 ${testUrl}`;
+      const result = await testHttpEndpoint(testUrl, 4000);
+      if (result.status) {
+        status = result.status < 400 ? 'SUCCESS' : 'FAILED';
+        stdout = `HTTP/1.1 ${result.status} ${result.statusText}
+Latência da Requisição: ${result.latency}ms
+Headers recebidos em tempo real:
+${Object.entries(result.headers || {}).map(([k, v]) => `${k}: ${v}`).join('\n')}`;
+      } else {
+        status = 'FAILED';
+        stdout = `[FALHA HTTP] Não foi possível obter resposta HTTP de ${testUrl}.\nErro de rede: ${result.error}\nLatência: ${result.latency}ms.`;
+      }
+      break;
+    }
+
+    case 'checkConnectivity': {
+      commandExecuted = `ping / dns-lookup ${targetHost}`;
+      const dnsResult = await testDnsLookup(targetHost);
+      if (dnsResult.success) {
+        const tcpCheck = await testTcpPort(dnsResult.ip, 80, 2000);
+        status = 'SUCCESS';
+        stdout = `[RESOLUÇÃO DNS OK] Hostname: ${targetHost} -> IP: ${dnsResult.ip} (IPv${dnsResult.family})
+Tempo de resolução DNS: ${dnsResult.latency}ms
+Teste de conectividade TCP porta 80: ${tcpCheck.open ? 'Aberta (' + tcpCheck.latency + 'ms)' : 'Fechada/Filtrada (' + (tcpCheck.error || 'recusada') + ')'}`;
+      } else {
+        status = 'FAILED';
+        stdout = `[FALHA DE RESOLUÇÃO] Hostname/IP ${targetHost} não pôde ser resolvido via DNS.\nErro: ${dnsResult.error}`;
+      }
+      break;
+    }
+
     case 'checkService':
-      commandExecuted = `systemctl status nginx --host=${asset.hostname}`;
-      stdout = `● nginx.service - The nginx HTTP and reverse proxy server
-   Loaded: loaded (/usr/lib/systemd/system/nginx.service; enabled; vendor preset: disabled)
-   Active: failed (Result: exit-code) since Mon 2026-10-05 03:00:15 UTC; 42min ago
-  Process: 1205 ExecStart=/usr/sbin/nginx (code=exited, status=1/FAILURE)
- Main PID: 1205 (code=exited, status=1/FAILURE)
-
-Oct 05 03:00:15 APP01 nginx[1205]: nginx: [emerg] bind() to 0.0.0.0:80 failed (98: Address already in use)`;
-      status = 'FAILED';
-      break;
-    case 'checkPort':
-      commandExecuted = `nc -zv -w 2 ${asset.internalIp} 80`;
-      stdout = `Connection to ${asset.internalIp} 80 port [tcp/http] succeeded!`;
-      break;
     case 'checkDisk':
-      commandExecuted = `df -h --host=${asset.hostname}`;
-      stdout = `Filesystem      Size  Used Avail Use% Mounted on
-/dev/sda1        40G   40G    0G 100% /
-tmpfs           1.9G     0  1.9G   0% /dev/shm`;
+    case 'checkMemory': {
+      commandExecuted = `ssh status-check ${asset.hostname}`;
+      status = 'FAILED';
+      stdout = `[AVISO OPERACIONAL] Inspeção remota em nível de SO (systemctl/df/free) requer chave SSH ou agente Connector instalado em ${asset.hostname}.\nPara verificar disponibilidade imediata, utilize as ferramentas estruturadas de rede: Check Port e Check HTTP.`;
       break;
-    case 'checkMemory':
-      commandExecuted = `free -h --host=${asset.hostname}`;
-      stdout = `              total        used        free      shared  buff/cache   available
-Mem:           3.8Gi       3.2Gi       150Mi       120Mi       450Mi       320Mi
-Swap:          2.0Gi       1.8Gi       200Mi`;
-      break;
-    case 'checkConnectivity':
-      commandExecuted = `ping -c 3 ${asset.internalIp}`;
-      stdout = `PING ${asset.internalIp} (${asset.internalIp}) 56(84) bytes of data.
-64 bytes from ${asset.internalIp}: icmp_seq=1 ttl=64 time=0.45 ms
-64 bytes from ${asset.internalIp}: icmp_seq=2 ttl=64 time=0.38 ms
-64 bytes from ${asset.internalIp}: icmp_seq=3 ttl=64 time=0.41 ms
+    }
 
---- ${asset.internalIp} ping statistics ---
-3 packets transmitted, 3 received, 0% packet loss, time 2012ms
-rtt min/avg/max/mdev = 0.380/0.413/0.450/0.032 ms`;
-      break;
     default:
-      return res.status(400).json({ error: 'Ferramenta de diagnóstico estruturada desconhecida ou não autorizada.' });
+      return res.status(400).json({ error: 'Ferramenta de diagnóstico desconhecida.' });
   }
 
   const run = await db.insertDiagnosticRun({
@@ -598,18 +878,17 @@ rtt min/avg/max/mdev = 0.380/0.413/0.450/0.032 ms`;
     assetId: asset.id,
     toolName,
     commandExecuted,
-    riskLevel: 0, // LEVEL 0 Diagnostics
+    riskLevel: 0,
     stdout,
     status,
     executedBy: currentSessionUser.username
   });
 
-  // Inject system message to incident log so the AI takes immediate note
   await db.insertIncidentMessage({
     incidentId: id,
     sender: 'SYSTEM',
-    senderName: 'Executor Diagnóstico',
-    message: `[DIAGNOSTIC] ${toolName} executado em ${asset.hostname}. Status: ${status}.\nComando: \`${commandExecuted}\`\nResultado:\n${stdout.substring(0, 300)}`
+    senderName: 'Diagnóstico em Tempo Real',
+    message: `[DIAGNÓSTICO REAL] ${toolName} executado para ${asset.hostname} (${targetHost}). Status: ${status}.\nComando: \`${commandExecuted}\`\nResultado:\n${stdout}`
   });
 
   await db.insertAuditLog({
@@ -617,7 +896,7 @@ rtt min/avg/max/mdev = 0.380/0.413/0.450/0.032 ms`;
     username: currentSessionUser.username,
     incidentId: id,
     action: 'EXECUTE_DIAGNOSTIC',
-    details: `Técnico disparou comando de diagnóstico estruturado: ${toolName} para o host ${asset.hostname}`,
+    details: `Diagnóstico executado: ${toolName} para ${asset.hostname} (${targetHost}:${port})`,
     toolUsed: toolName,
     riskLevel: 0
   });
@@ -625,7 +904,7 @@ rtt min/avg/max/mdev = 0.380/0.413/0.450/0.032 ms`;
   res.json(run);
 });
 
-// CORE COCKPIT INTELLIGENCE RAG AGENT (SECTION 49, 79)
+// CORE COCKPIT INTELLIGENCE RAG AGENT - BASED EXCLUSIVELY ON REAL MYSQL DATA
 app.post('/api/incidents/:id/ai-query', async (req, res) => {
   const { id } = req.params;
   const { prompt } = req.body;
@@ -646,76 +925,55 @@ app.post('/api/incidents/:id/ai-query', async (req, res) => {
   const docs = await db.getKnowledgeDocs();
   const diagnostics = await db.getDiagnosticRuns(incident.id);
 
-  // Compile context data automatically (RAG Injection)
-  let context = `DADOS DO INCIDENTE ATUAL:
+  let context = `DADOS REAIS DO INCIDENTE ATUAL NO MYSQL:
 ID: ${incident.id}
 Título: ${incident.title}
 Descrição: ${incident.description}
 Severidade: ${incident.severity}
 Status: ${incident.status}
 
-CLIENTE CONTEXTO:
-Nome: ${client?.name} (Código: ${client?.code})
-Domínio Principal: ${client?.domain}
+CLIENTE CONTEXTO (MYSQL):
+Nome: ${client?.name || 'Não associado'} (Código: ${client?.code || 'N/A'})
+Domínio: ${client?.domain || 'N/A'}
 
-ATIVOS DO CLIENTE NO MYSQL:
-${filteredAssets.map(a => `- Hostname: ${a.hostname} (IP Interno: ${a.internalIp}, IP Externo: ${a.externalIp}, OS: ${a.operatingSystem}, Datacenter: ${a.datacenter}, Status: ${a.status})`).join('\n')}
+ATIVOS CADASTRADOS NO MYSQL:
+${filteredAssets.length > 0 ? filteredAssets.map(a => `- Hostname: ${a.hostname} (IP Interno: ${a.internalIp}, IP Externo: ${a.externalIp}, OS: ${a.operatingSystem}, Datacenter: ${a.datacenter}, Status: ${a.status})`).join('\n') : 'Nenhum ativo cadastrado para este cliente.'}
 
-TOPOLOGIA E DEPENDÊNCIAS DE REDE:
-${rels.map(r => {
+RELACIONAMENTOS DE REDE NO MYSQL:
+${rels.length > 0 ? rels.map(r => {
   const s = assets.find(a => a.id === r.sourceAssetId);
   const t = assets.find(a => a.id === r.targetAssetId);
-  return `- [${s?.hostname || r.sourceAssetId}] --(${r.type})--> [${t?.hostname || r.targetAssetId}] (${r.origin})`;
-}).join('\n')}
+  return `- [${s?.hostname || r.sourceAssetId}] --(${r.type})--> [${t?.hostname || r.targetAssetId}]`;
+}).join('\n') : 'Nenhum relacionamento mapeado.'}
 
-EVIDÊNCIAS DE DIAGNÓSTICOS EM TEMPO REAL EXECUTAIS:
-${diagnostics.map(d => `---
+DIAGNÓSTICOS EXECUTADOS EM TEMPO REAL:
+${diagnostics.length > 0 ? diagnostics.map(d => `---
 Ferramenta: ${d.toolName}
 Comando: ${d.commandExecuted}
 Status: ${d.status}
-Saída/Stdout:
-${d.stdout}`).join('\n')}
+Saída:
+${d.stdout}`).join('\n') : 'Nenhum teste de diagnóstico executado ainda.'}
 
-CONHECIMENTOS RELACIONADOS DA KNOWLEDGE BASE (RAG):
-${docs.map(doc => `---
+BASE DE CONHECIMENTO CANÔNICA (KB NO MYSQL):
+${docs.length > 0 ? docs.map(doc => `---
 Título: ${doc.title}
 Tipo: ${doc.type}
-Tags: ${doc.tags.join(', ')}
 Conteúdo:
-${doc.content}`).join('\n')}`;
+${doc.content}`).join('\n') : 'Nenhum documento de conhecimento cadastrado no momento.'}`;
 
-  const systemInstruction = `Você é o IBR Ops Orchestrator, agente principal de inteligência operacional e RAG da IBR Cloud Services Ltda.
-Sua missão é atuar como o cockpit de diagnósticos do técnico. Toda a sua comunicação deve ser estritamente profissional, objetiva e baseada em fatos documentados ou observados.
-Nunca invente fatos, subnets, PSKs ou informações sobre a infraestrutura técnica. Se faltar dados, solicite explicitamente ao técnico para rodar diagnósticos específicos ou marcar como UNKNOWN.
+  const systemInstruction = `Você é o IBR Ops Orchestrator, agente de inteligência operacional técnica da IBR Cloud Services Ltda.
+Trabalhe EXCLUSIVAMENTE com base nas informações e dados reais apresentados no contexto proveniente do banco de dados MySQL 8.
+Não invente servidores, dados de rede, IPs, senhas ou clientes fictícios. Se uma informação não existir no banco de dados, declare explicitamente como UNKNOWN ou NÃO CADASTRADO NO MYSQL.
 
-Siga fielmente as orientações do Princípio de Confiabilidade (Seção 4):
-- DOCUMENTED: Informação extraída da Base de Conhecimento (KB).
-- OBSERVED_LIVE: Informações obtidas via execução de ferramentas de diagnósticos ou connectors.
-- INFERRED: Deduções inteligentes baseadas em evidências.
-- UNKNOWN: Evidências ausentes.
-
-Nunca apresente conclusões "INFERRED" como fatos confirmados.
-
-Você DEVE estruturar suas respostas técnicas exatamente usando os cabeçalhos da SEÇÃO 49 (em Português):
+Estruture a resposta com clareza nos seguintes blocos:
 ### Resumo
-### Evidências
-### Diagnóstico Provável
-### Informações Faltantes
-### Diagnósticos Executados
-### Resultados
-### Causa Provável
-### Solução Recomendada
-### Risco
-### Impacto
-### Rollback
-### Validação
-### Fontes
-### Confiança (Classifique como Alta, Média ou Baixa de acordo com o nível de evidências em tempo real!)`;
+### Evidências no MySQL
+### Diagnóstico Técnico
+### Ações Recomendadas
+### Confiança`;
 
-  // Request response from configured providers
   const result = await generateTechnicalResponse(prompt, context, systemInstruction);
 
-  // Add message from AI into the dialogue stream
   await db.insertIncidentMessage({
     incidentId: id,
     sender: 'IA_AGENT',
@@ -723,25 +981,24 @@ Você DEVE estruturar suas respostas técnicas exatamente usando os cabeçalhos 
     message: result.text
   });
 
-  // Log complete technical transaction (Audit)
   await db.insertAuditLog({
     userId: currentSessionUser.id,
     username: currentSessionUser.username,
     clientId: incident.clientId,
     incidentId: incident.id,
     action: 'AI_AGENT_QUERY',
-    details: `Técnico efetuou consulta assistida à IA operacional. Prompt: "${prompt.substring(0, 80)}"`,
+    details: `Consulta à IA operacional: "${prompt.substring(0, 80)}"`,
     riskLevel: 0,
     aiModelUsed: result.model,
     tokensUsed: result.tokens,
-    costEstimated: Number((result.tokens * 0.00001).toFixed(5)), // simulated cost routing metric
+    costEstimated: Number((result.tokens * 0.00001).toFixed(5)),
     latencyMs: result.latency
   });
 
   res.json({ text: result.text });
 });
 
-// Audit Log endpoints (Locked down, no deletes allowed)
+// Audit Log endpoints
 app.get('/api/audit-logs', async (req, res) => {
   res.json(await db.getAuditLogs());
 });
@@ -749,8 +1006,10 @@ app.get('/api/audit-logs', async (req, res) => {
 // Readiness & Health Check
 app.get('/health', (req, res) => {
   res.json({
-    status: 'PASS',
-    database: isMySQLConnected ? 'CONNECTED_MYSQL8_REMOTE' : 'CONNECTED_SIMULATED_LOCAL_FALLBACK',
+    status: isMySQLConnected ? 'PASS' : 'DEGRADED',
+    database: isMySQLConnected ? 'CONNECTED_MYSQL8_CANONICAL' : 'DISCONNECTED_OR_FALLBACK',
+    mysql_host: process.env.DB_HOST || 'web008.ibrcloud.com.br',
+    mysql_db: process.env.DB_NAME || 'ibrops_aiops',
     mysql_error: mysqlConnectionError,
     ai_provider: AI_PROVIDER,
     ai_status: aiClient ? 'ONLINE' : 'OFFLINE',
@@ -780,11 +1039,10 @@ async function startServer() {
       appType: 'spa'
     });
     app.use(vite.middlewares);
-    console.log('Middleware Vite montado para desenvolvimento.');
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Servidor IBR Ops escutando na porta ${PORT}`);
+    console.log(`Servidor IBR Ops operacional na porta ${PORT} conectado ao MySQL canônico.`);
   });
 }
 

@@ -3,7 +3,7 @@ import path from 'path';
 import { isMySQLConnected, query, initMySQL } from './mysql_db';
 
 // server_db.ts - Relational persistence layer for IBR Ops
-// Integrates remote MySQL 8 on web008.ibrcloud.com.br and falls back to local JSON dynamically.
+// Real MySQL 8 on web008.ibrcloud.com.br - NO MOCKUPS.
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'database.json');
@@ -20,7 +20,7 @@ export interface User {
 export interface Client {
   id: string;
   name: string;
-  code: string; // e.g. CRECI_DF
+  code: string;
   domain: string;
   criticality: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
   status: 'ACTIVE' | 'INACTIVE';
@@ -40,9 +40,9 @@ export interface ClientContact {
 export interface Asset {
   id: string;
   clientId: string;
-  datacenter: string; // e.g. WEB020 (Canada), WEB008 (Brasil)
+  datacenter: string;
   environment: 'PRODUCTION' | 'STAGING' | 'DEVELOPMENT';
-  type: 'PHYSICAL_SERVER' | 'VM' | 'CONTAINER' | 'FIREWALL' | 'ROUTER' | 'SWITCH' | 'PROXY' | 'DATABASE' | 'APPLICATION' | 'STORAGE' | 'BACKUP_SERVER' | 'CLOUD_SERVICE' | 'OTHER';
+  type: string;
   hostname: string;
   displayName: string;
   internalIp: string;
@@ -59,19 +59,19 @@ export interface AssetRelationship {
   id: string;
   sourceAssetId: string;
   targetAssetId: string;
-  type: 'CONNECTED_TO' | 'VPN_CONNECTED_TO' | 'ROUTES_TO' | 'PROXIES' | 'LOAD_BALANCES' | 'HOSTS' | 'DEPENDS_ON' | 'BACKS_UP' | 'REPLICATES_TO' | 'MONITORS' | 'SERVES' | 'PROTECTED_BY' | 'RESOLVES_TO';
-  origin: 'MANUAL' | 'DOCUMENT' | 'DISCOVERY' | 'PFSENSE' | 'PROXMOX' | 'SSH' | 'ZABBIX' | 'CLOUDFLARE' | 'OTHER';
-  status: 'ACTIVE' | 'DEGRADED' | 'INACTIVE';
+  type: string;
+  origin: string;
+  status: string;
 }
 
 export interface KnowledgeDocument {
   id: string;
   title: string;
-  clientId?: string; // If specific to client
+  clientId?: string;
   environment?: string;
-  type: 'GLOBAL' | 'CLIENT' | 'TECHNOLOGY' | 'RUNBOOK' | 'INCIDENT' | 'POLICY' | 'ARCHITECTURE' | 'HISTORICAL';
+  type: string;
   category: string;
-  criticality: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  criticality: string;
   tags: string[];
   status: 'DRAFT' | 'VERIFIED' | 'CANONICAL' | 'SUPERSEDED' | 'ARCHIVED';
   content: string;
@@ -98,7 +98,7 @@ export interface RepositoryFile {
   id: string;
   fileName: string;
   fileSize: number;
-  category: 'Caixa de Entrada' | 'IBR Global' | 'Clientes' | 'Infraestrutura' | 'Runbooks' | 'Incidentes Históricos' | 'Descobertas' | 'Arquivados';
+  category: string;
   status: 'PENDING' | 'PROCESSED' | 'ERROR';
   content: string;
   uploadedAt: string;
@@ -165,7 +165,6 @@ export interface DiagnosticRun {
   timestamp: string;
 }
 
-// Full Relational State Database Representation
 export interface DBState {
   users: User[];
   clients: Client[];
@@ -181,131 +180,50 @@ export interface DBState {
   diagnostic_runs: DiagnosticRun[];
 }
 
-const DEFAULT_DB_STATE: DBState = {
+// Clean state without any mockups
+const CLEAN_DB_STATE: DBState = {
   users: [
-    { id: 'usr-1', username: 'bruno_admin', email: 'bruno.fantoni@inframail.com.br', role: 'ADMIN', status: 'ACTIVE' },
-    { id: 'usr-2', username: 'tech_diego', email: 'diego.tecnico@inframail.com.br', role: 'TECHNICIAN', status: 'ACTIVE' },
-    { id: 'usr-3', username: 'viewer_clara', email: 'clara.viewer@inframail.com.br', role: 'VIEWER', status: 'ACTIVE' }
+    { id: 'usr-admin', username: 'bruno_admin', email: 'bruno.fantoni@inframail.com.br', role: 'ADMIN', status: 'ACTIVE' }
   ],
-  clients: [
-    { id: 'cli-1', name: 'CRECI DF - Conselho Regional de Corretores de Imóveis', code: 'CRECI_DF', domain: 'crecidf.org.br', criticality: 'HIGH', status: 'ACTIVE', sla_hours: 4, createdAt: '2026-01-15T10:00:00Z' },
-    { id: 'cli-2', name: 'IBR Global Services', code: 'IBR_GLOBAL', domain: 'ibrcloud.com.br', criticality: 'CRITICAL', status: 'ACTIVE', sla_hours: 2, createdAt: '2026-01-01T08:00:00Z' }
-  ],
-  client_contacts: [
-    { id: 'cnt-1', clientId: 'cli-1', name: 'Dr. Geraldo Silva', email: 'geral@crecidf.org.br', phone: '(61) 3328-1010', role: 'Diretor de TI' },
-    { id: 'cnt-2', clientId: 'cli-2', name: 'Bruno Fantoni', email: 'bruno.fantoni@inframail.com.br', phone: '(11) 99999-8888', role: 'Diretor Operacional' }
-  ],
-  assets: [
-    { id: 'ast-020', clientId: 'cli-2', datacenter: 'Canadá (OVH)', environment: 'PRODUCTION', type: 'PROXY', hostname: 'WEB020', displayName: 'WEB020 Proxy Central', internalIp: '192.168.20.20', externalIp: '198.50.120.20', operatingSystem: 'AlmaLinux 9', version: '9.4', criticality: 'CRITICAL', status: 'ACTIVE', lastDiscovery: '2026-10-05T00:00:00Z', lastValidation: '2026-10-05T03:00:00Z' },
-    { id: 'ast-008', clientId: 'cli-2', datacenter: 'Brasil (Equinix)', environment: 'PRODUCTION', type: 'PROXY', hostname: 'WEB008', displayName: 'WEB008 Proxy Local', internalIp: '192.168.8.8', externalIp: '200.120.8.8', operatingSystem: 'AlmaLinux 9', version: '9.4', criticality: 'CRITICAL', status: 'ACTIVE', lastDiscovery: '2026-10-05T01:00:00Z', lastValidation: '2026-10-05T03:00:00Z' },
-    { id: 'ast-101', clientId: 'cli-1', datacenter: 'Canadá (OVH)', environment: 'PRODUCTION', type: 'APPLICATION', hostname: 'APP01', displayName: 'CRECI APP01 Webserver', internalIp: '192.168.10.11', externalIp: '198.50.120.31', operatingSystem: 'AlmaLinux 9', version: '9.4', criticality: 'HIGH', status: 'DEGRADED', lastDiscovery: '2026-10-05T01:15:00Z', lastValidation: '2026-10-05T03:15:00Z' },
-    { id: 'ast-102', clientId: 'cli-1', datacenter: 'Canadá (OVH)', environment: 'PRODUCTION', type: 'DATABASE', hostname: 'DB01', displayName: 'CRECI DB01 Database', internalIp: '192.168.10.12', externalIp: '198.50.120.32', operatingSystem: 'Rocky Linux 9', version: '9.3', criticality: 'HIGH', status: 'ACTIVE', lastDiscovery: '2026-10-05T01:20:00Z', lastValidation: '2026-10-05T03:20:00Z' }
-  ],
-  asset_relationships: [
-    { id: 'rel-1', sourceAssetId: 'ast-020', targetAssetId: 'ast-008', type: 'VPN_CONNECTED_TO', origin: 'DISCOVERY', status: 'ACTIVE' },
-    { id: 'rel-2', sourceAssetId: 'ast-101', targetAssetId: 'ast-102', type: 'DEPENDS_ON', origin: 'DOCUMENT', status: 'ACTIVE' },
-    { id: 'rel-3', sourceAssetId: 'ast-020', targetAssetId: 'ast-101', type: 'PROXIES', origin: 'DISCOVERY', status: 'ACTIVE' }
-  ],
-  knowledge_documents: [
-    {
-      id: 'doc-1',
-      title: 'Runbook: Diagnóstico de Erro 502 Bad Gateway no Proxy WEB020',
-      clientId: 'cli-2',
-      type: 'RUNBOOK',
-      category: 'Proxy Web',
-      criticality: 'HIGH',
-      tags: ['nginx', '502', 'web020', 'backend-offline'],
-      status: 'CANONICAL',
-      content: `### Procedimento de Diagnóstico Nginx 502 Bad Gateway...`,
-      createdAt: '2026-02-10T14:00:00Z',
-      updatedAt: '2026-02-10T14:00:00Z',
-      verifiedAt: '2026-02-11T10:00:00Z',
-      verifiedBy: 'bruno_admin',
-      version: 1
-    }
-  ],
+  clients: [],
+  client_contacts: [],
+  assets: [],
+  asset_relationships: [],
+  knowledge_documents: [],
   knowledge_conflicts: [],
   repository_files: [],
-  incidents: [
-    {
-      id: 'inc-1',
-      clientId: 'cli-1',
-      assetId: 'ast-101',
-      title: 'Portal do CRECI DF retornando HTTP 502 Bad Gateway no Proxy Central',
-      description: 'O portal institucional do CRECI DF está inacessível. O proxy central WEB020 exibe erro 502 Bad Gateway ao tentar encaminhar requisições para o servidor de aplicação APP01.',
-      status: 'NEW',
-      severity: 'HIGH',
-      createdAt: '2026-10-05T03:00:00Z',
-      updatedAt: '2026-10-05T03:00:00Z'
-    }
-  ],
-  incident_messages: [
-    {
-      id: 'msg-1',
-      incidentId: 'inc-1',
-      sender: 'SYSTEM',
-      senderName: 'Monitoramento IBR',
-      message: 'Alerta recebido do Proxy WEB020: Upstream APP01 (192.168.10.11) parou de responder na porta 80.',
-      createdAt: '2026-10-05T03:01:00Z'
-    }
-  ],
-  audit_logs: [
-    {
-      id: 'aud-1',
-      userId: 'usr-1',
-      username: 'bruno_admin',
-      action: 'BOOTSTRAP',
-      details: 'Inicialização canônica do sistema e preenchimento da carga inicial de clientes e ativos.',
-      riskLevel: 0,
-      timestamp: '2026-10-05T03:42:00Z'
-    }
-  ],
+  incidents: [],
+  incident_messages: [],
+  audit_logs: [],
   diagnostic_runs: []
 };
 
-class SimulatedDatabase {
-  private state: DBState = { ...DEFAULT_DB_STATE };
-  private mysqlLoaded = false;
+class MySQLDatabaseManager {
+  private state: DBState = { ...CLEAN_DB_STATE };
 
   constructor() {
     this.init();
   }
 
   private async init() {
-    // 1. Load simulated file database
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    if (fs.existsSync(DB_FILE)) {
-      try {
-        const fileContent = fs.readFileSync(DB_FILE, 'utf-8');
-        this.state = JSON.parse(fileContent);
-      } catch (e) {
-        this.state = { ...DEFAULT_DB_STATE };
-      }
-    } else {
-      this.state = { ...DEFAULT_DB_STATE };
-      this.save();
-    }
-
-    // 2. Trigger asynchronous MySQL connection handshake
     try {
       await initMySQL();
-      this.mysqlLoaded = true;
     } catch (e) {
-      console.warn('MySQL init exception, continuing in simulated file mode.', e);
+      console.warn('MySQL init exception:', e);
     }
   }
 
   public save() {
-    try {
-      fs.writeFileSync(DB_FILE, JSON.stringify(this.state, null, 2), 'utf-8');
-    } catch (e) {
-      console.error('Falha ao persistir banco simulado.', e);
+    // Kept as no-op or local fallback sync
+    if (fs.existsSync(DATA_DIR)) {
+      try {
+        fs.writeFileSync(DB_FILE, JSON.stringify(this.state, null, 2), 'utf-8');
+      } catch (e) {
+        // silent
+      }
     }
   }
 
-  // Generic and Entity specific operations with MySQL routing
   public getState(): DBState {
     return this.state;
   }
@@ -316,7 +234,7 @@ class SimulatedDatabase {
         const rows = await query('SELECT * FROM users');
         return rows as User[];
       } catch (e) {
-        console.error('MySQL getUsers fail, using local state.', e);
+        console.error('MySQL getUsers fail:', e);
       }
     }
     return this.state.users;
@@ -325,13 +243,43 @@ class SimulatedDatabase {
   public async getClients(): Promise<Client[]> {
     if (isMySQLConnected) {
       try {
-        const rows = await query('SELECT * FROM clients');
+        const rows = await query('SELECT * FROM clients ORDER BY createdAt DESC');
         return rows as Client[];
       } catch (e) {
-        console.error('MySQL getClients fail, using local state.', e);
+        console.error('MySQL getClients fail:', e);
       }
     }
     return this.state.clients;
+  }
+
+  public async createClient(clientData: Omit<Client, 'id' | 'createdAt'>): Promise<Client> {
+    const newClient: Client = {
+      id: `cli-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      createdAt: new Date().toISOString(),
+      ...clientData
+    };
+
+    if (isMySQLConnected) {
+      await query(`INSERT INTO clients (id, name, code, domain, criticality, status, sla_hours, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [newClient.id, newClient.name, newClient.code, newClient.domain, newClient.criticality, newClient.status, newClient.sla_hours, newClient.createdAt]
+      );
+    }
+    this.state.clients.unshift(newClient);
+    return newClient;
+  }
+
+  public async deleteClient(clientId: string): Promise<boolean> {
+    if (isMySQLConnected) {
+      await query('DELETE FROM client_contacts WHERE clientId = ?', [clientId]);
+      await query('DELETE FROM assets WHERE clientId = ?', [clientId]);
+      await query('DELETE FROM incidents WHERE clientId = ?', [clientId]);
+      await query('DELETE FROM clients WHERE id = ?', [clientId]);
+    }
+    this.state.clients = this.state.clients.filter(c => c.id !== clientId);
+    this.state.assets = this.state.assets.filter(a => a.clientId !== clientId);
+    this.state.incidents = this.state.incidents.filter(i => i.clientId !== clientId);
+    return true;
   }
 
   public async getClientContacts(clientId: string): Promise<ClientContact[]> {
@@ -340,7 +288,7 @@ class SimulatedDatabase {
         const rows = await query('SELECT * FROM client_contacts WHERE clientId = ?', [clientId]);
         return rows as ClientContact[];
       } catch (e) {
-        console.error('MySQL getClientContacts fail, using local state.', e);
+        console.error('MySQL getClientContacts fail:', e);
       }
     }
     return this.state.client_contacts.filter(c => c.clientId === clientId);
@@ -349,13 +297,42 @@ class SimulatedDatabase {
   public async getAssets(): Promise<Asset[]> {
     if (isMySQLConnected) {
       try {
-        const rows = await query('SELECT * FROM assets');
+        const rows = await query('SELECT * FROM assets ORDER BY hostname ASC');
         return rows as Asset[];
       } catch (e) {
-        console.error('MySQL getAssets fail, using local state.', e);
+        console.error('MySQL getAssets fail:', e);
       }
     }
     return this.state.assets;
+  }
+
+  public async createAsset(assetData: Omit<Asset, 'id' | 'lastDiscovery' | 'lastValidation'>): Promise<Asset> {
+    const newAsset: Asset = {
+      id: `ast-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      lastDiscovery: new Date().toISOString(),
+      lastValidation: new Date().toISOString(),
+      ...assetData
+    };
+
+    if (isMySQLConnected) {
+      await query(`INSERT INTO assets (id, clientId, datacenter, environment, type, hostname, displayName, internalIp, externalIp, operatingSystem, version, criticality, status, lastDiscovery, lastValidation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [newAsset.id, newAsset.clientId, newAsset.datacenter, newAsset.environment, newAsset.type, newAsset.hostname, newAsset.displayName, newAsset.internalIp, newAsset.externalIp, newAsset.operatingSystem, newAsset.version, newAsset.criticality, newAsset.status, newAsset.lastDiscovery, newAsset.lastValidation]
+      );
+    }
+    this.state.assets.push(newAsset);
+    return newAsset;
+  }
+
+  public async deleteAsset(assetId: string): Promise<boolean> {
+    if (isMySQLConnected) {
+      await query('DELETE FROM asset_relationships WHERE sourceAssetId = ? OR targetAssetId = ?', [assetId, assetId]);
+      await query('DELETE FROM diagnostic_runs WHERE assetId = ?', [assetId]);
+      await query('DELETE FROM assets WHERE id = ?', [assetId]);
+    }
+    this.state.assets = this.state.assets.filter(a => a.id !== assetId);
+    this.state.asset_relationships = this.state.asset_relationships.filter(r => r.sourceAssetId !== assetId && r.targetAssetId !== assetId);
+    return true;
   }
 
   public async getAssetRelationships(): Promise<AssetRelationship[]> {
@@ -364,35 +341,84 @@ class SimulatedDatabase {
         const rows = await query('SELECT * FROM asset_relationships');
         return rows as AssetRelationship[];
       } catch (e) {
-        console.error('MySQL getAssetRelationships fail, using local state.', e);
+        console.error('MySQL getAssetRelationships fail:', e);
       }
     }
     return this.state.asset_relationships;
   }
 
+  public async createAssetRelationship(relData: Omit<AssetRelationship, 'id'>): Promise<AssetRelationship> {
+    const newRel: AssetRelationship = {
+      id: `rel-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      ...relData
+    };
+    if (isMySQLConnected) {
+      await query(`INSERT INTO asset_relationships (id, sourceAssetId, targetAssetId, type, origin, status)
+        VALUES (?, ?, ?, ?, ?, ?)`,
+        [newRel.id, newRel.sourceAssetId, newRel.targetAssetId, newRel.type, newRel.origin, newRel.status]
+      );
+    }
+    this.state.asset_relationships.push(newRel);
+    return newRel;
+  }
+
+  public async deleteAssetRelationship(relId: string): Promise<boolean> {
+    if (isMySQLConnected) {
+      await query('DELETE FROM asset_relationships WHERE id = ?', [relId]);
+    }
+    this.state.asset_relationships = this.state.asset_relationships.filter(r => r.id !== relId);
+    return true;
+  }
+
   public async getKnowledgeDocs(): Promise<KnowledgeDocument[]> {
     if (isMySQLConnected) {
       try {
-        const rows = await query('SELECT * FROM knowledge_documents');
-        const docs = rows.map((r: any) => ({
+        const rows = await query('SELECT * FROM knowledge_documents ORDER BY updatedAt DESC');
+        return rows.map((r: any) => ({
           ...r,
           tags: r.tags ? r.tags.split(',').map((t: string) => t.trim()) : []
-        }));
-        return docs as KnowledgeDocument[];
+        })) as KnowledgeDocument[];
       } catch (e) {
-        console.error('MySQL getKnowledgeDocs fail, using local state.', e);
+        console.error('MySQL getKnowledgeDocs fail:', e);
       }
     }
     return this.state.knowledge_documents;
   }
 
+  public async createKnowledgeDoc(docData: Omit<KnowledgeDocument, 'id' | 'createdAt' | 'updatedAt' | 'version'>): Promise<KnowledgeDocument> {
+    const newDoc: KnowledgeDocument = {
+      id: `doc-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      version: 1,
+      ...docData
+    };
+
+    if (isMySQLConnected) {
+      await query(`INSERT INTO knowledge_documents (id, title, clientId, environment, type, category, criticality, tags, status, content, createdAt, updatedAt, version) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [newDoc.id, newDoc.title, newDoc.clientId || null, newDoc.environment || null, newDoc.type, newDoc.category, newDoc.criticality, newDoc.tags.join(','), newDoc.status, newDoc.content, newDoc.createdAt, newDoc.updatedAt, newDoc.version]
+      );
+    }
+    this.state.knowledge_documents.unshift(newDoc);
+    return newDoc;
+  }
+
+  public async deleteKnowledgeDoc(docId: string): Promise<boolean> {
+    if (isMySQLConnected) {
+      await query('DELETE FROM knowledge_documents WHERE id = ?', [docId]);
+    }
+    this.state.knowledge_documents = this.state.knowledge_documents.filter(d => d.id !== docId);
+    return true;
+  }
+
   public async getConflicts(): Promise<KnowledgeConflict[]> {
     if (isMySQLConnected) {
       try {
-        const rows = await query('SELECT * FROM knowledge_conflicts');
+        const rows = await query('SELECT * FROM knowledge_conflicts WHERE status = "OPEN"');
         return rows as KnowledgeConflict[];
       } catch (e) {
-        console.error('MySQL getConflicts fail, using local state.', e);
+        console.error('MySQL getConflicts fail:', e);
       }
     }
     return this.state.knowledge_conflicts;
@@ -401,13 +427,13 @@ class SimulatedDatabase {
   public async getRepositoryFiles(): Promise<RepositoryFile[]> {
     if (isMySQLConnected) {
       try {
-        const rows = await query('SELECT * FROM repository_files');
+        const rows = await query('SELECT * FROM repository_files ORDER BY uploadedAt DESC');
         return rows.map((r: any) => ({
           ...r,
           autoExtractedMetadata: r.autoExtractedMetadata ? JSON.parse(r.autoExtractedMetadata) : undefined
         })) as RepositoryFile[];
       } catch (e) {
-        console.error('MySQL getRepositoryFiles fail, using local state.', e);
+        console.error('MySQL getRepositoryFiles fail:', e);
       }
     }
     return this.state.repository_files;
@@ -416,22 +442,52 @@ class SimulatedDatabase {
   public async getIncidents(): Promise<Incident[]> {
     if (isMySQLConnected) {
       try {
-        const rows = await query('SELECT * FROM incidents');
+        const rows = await query('SELECT * FROM incidents ORDER BY createdAt DESC');
         return rows as Incident[];
       } catch (e) {
-        console.error('MySQL getIncidents fail, using local state.', e);
+        console.error('MySQL getIncidents fail:', e);
       }
     }
     return this.state.incidents;
   }
 
+  public async createIncident(incidentData: Omit<Incident, 'id' | 'createdAt' | 'updatedAt'>): Promise<Incident> {
+    const newInc: Incident = {
+      id: `inc-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      ...incidentData
+    };
+
+    if (isMySQLConnected) {
+      await query(`INSERT INTO incidents (id, clientId, assetId, title, description, status, severity, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [newInc.id, newInc.clientId, newInc.assetId || null, newInc.title, newInc.description, newInc.status, newInc.severity, newInc.createdAt, newInc.updatedAt]
+      );
+    }
+    this.state.incidents.unshift(newInc);
+    return newInc;
+  }
+
+  public async deleteIncident(incidentId: string): Promise<boolean> {
+    if (isMySQLConnected) {
+      await query('DELETE FROM incident_messages WHERE incidentId = ?', [incidentId]);
+      await query('DELETE FROM diagnostic_runs WHERE incidentId = ?', [incidentId]);
+      await query('DELETE FROM incidents WHERE id = ?', [incidentId]);
+    }
+    this.state.incidents = this.state.incidents.filter(i => i.id !== incidentId);
+    this.state.incident_messages = this.state.incident_messages.filter(m => m.incidentId !== incidentId);
+    this.state.diagnostic_runs = this.state.diagnostic_runs.filter(d => d.incidentId !== incidentId);
+    return true;
+  }
+
   public async getIncidentMessages(incidentId: string): Promise<IncidentMessage[]> {
     if (isMySQLConnected) {
       try {
-        const rows = await query('SELECT * FROM incident_messages WHERE incidentId = ?', [incidentId]);
+        const rows = await query('SELECT * FROM incident_messages WHERE incidentId = ? ORDER BY createdAt ASC', [incidentId]);
         return rows as IncidentMessage[];
       } catch (e) {
-        console.error('MySQL getIncidentMessages fail, using local state.', e);
+        console.error('MySQL getIncidentMessages fail:', e);
       }
     }
     return this.state.incident_messages.filter(m => m.incidentId === incidentId);
@@ -440,10 +496,10 @@ class SimulatedDatabase {
   public async getAuditLogs(): Promise<AuditLog[]> {
     if (isMySQLConnected) {
       try {
-        const rows = await query('SELECT * FROM audit_logs ORDER BY timestamp DESC');
+        const rows = await query('SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT 100');
         return rows as AuditLog[];
       } catch (e) {
-        console.error('MySQL getAuditLogs fail, using local state.', e);
+        console.error('MySQL getAuditLogs fail:', e);
       }
     }
     return this.state.audit_logs;
@@ -458,11 +514,11 @@ class SimulatedDatabase {
           sql += ' WHERE incidentId = ?';
           params.push(incidentId);
         }
-        sql += ' ORDER BY timestamp DESC';
+        sql += ' ORDER BY timestamp DESC LIMIT 50';
         const rows = await query(sql, params);
         return rows as DiagnosticRun[];
       } catch (e) {
-        console.error('MySQL getDiagnosticRuns fail, using local state.', e);
+        console.error('MySQL getDiagnosticRuns fail:', e);
       }
     }
     if (incidentId) {
@@ -471,7 +527,6 @@ class SimulatedDatabase {
     return this.state.diagnostic_runs;
   }
 
-  // Insertion helper operations mimicking SQL transactions
   public async insertAuditLog(log: Omit<AuditLog, 'id' | 'timestamp'>): Promise<AuditLog> {
     const newLog: AuditLog = {
       id: `aud-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -487,12 +542,11 @@ class SimulatedDatabase {
           [newLog.id, newLog.userId, newLog.username, newLog.clientId || null, newLog.incidentId || null, newLog.action, newLog.details, newLog.toolUsed || null, newLog.riskLevel, newLog.aiModelUsed || null, newLog.tokensUsed || null, newLog.costEstimated || null, newLog.latencyMs || null, newLog.timestamp]
         );
       } catch (e) {
-        console.error('MySQL insertAuditLog fail, using local state fallback.', e);
+        console.error('MySQL insertAuditLog fail:', e);
       }
     }
 
     this.state.audit_logs.unshift(newLog);
-    this.save();
     return newLog;
   }
 
@@ -510,17 +564,15 @@ class SimulatedDatabase {
           [newMsg.id, newMsg.incidentId, newMsg.sender, newMsg.senderName, newMsg.message, newMsg.createdAt]
         );
       } catch (e) {
-        console.error('MySQL insertIncidentMessage fail, using local state fallback.', e);
+        console.error('MySQL insertIncidentMessage fail:', e);
       }
     }
 
     this.state.incident_messages.push(newMsg);
-    this.save();
     return newMsg;
   }
 
   public async updateIncidentStatus(incidentId: string, status: Incident['status']): Promise<Incident | undefined> {
-    const incident = this.state.incidents.find(i => i.id === incidentId);
     const resolvedAt = status === 'RESOLVED' ? new Date().toISOString() : null;
     const updatedAt = new Date().toISOString();
 
@@ -530,24 +582,23 @@ class SimulatedDatabase {
           [status, updatedAt, resolvedAt, incidentId]
         );
       } catch (e) {
-        console.error('MySQL updateIncidentStatus fail, using local state fallback.', e);
+        console.error('MySQL updateIncidentStatus fail:', e);
       }
     }
 
+    const incident = this.state.incidents.find(i => i.id === incidentId);
     if (incident) {
       incident.status = status;
       incident.updatedAt = updatedAt;
       if (status === 'RESOLVED') {
         incident.resolvedAt = resolvedAt || undefined;
       }
-      this.save();
       return incident;
     }
     return undefined;
   }
 
   public async updateIncidentSeverity(incidentId: string, severity: Incident['severity']): Promise<Incident | undefined> {
-    const incident = this.state.incidents.find(i => i.id === incidentId);
     const updatedAt = new Date().toISOString();
 
     if (isMySQLConnected) {
@@ -556,14 +607,14 @@ class SimulatedDatabase {
           [severity, updatedAt, incidentId]
         );
       } catch (e) {
-        console.error('MySQL updateIncidentSeverity fail, using local state fallback.', e);
+        console.error('MySQL updateIncidentSeverity fail:', e);
       }
     }
 
+    const incident = this.state.incidents.find(i => i.id === incidentId);
     if (incident) {
       incident.severity = severity;
       incident.updatedAt = updatedAt;
-      this.save();
       return incident;
     }
     return undefined;
@@ -583,38 +634,16 @@ class SimulatedDatabase {
           [newRun.id, newRun.incidentId, newRun.assetId, newRun.toolName, newRun.commandExecuted, newRun.riskLevel, newRun.stdout, newRun.status, newRun.executedBy, newRun.timestamp]
         );
       } catch (e) {
-        console.error('MySQL insertDiagnosticRun fail, using local state fallback.', e);
+        console.error('MySQL insertDiagnosticRun fail:', e);
       }
     }
 
     this.state.diagnostic_runs.unshift(newRun);
-    this.save();
     return newRun;
   }
 
   public async insertKnowledgeDoc(doc: Omit<KnowledgeDocument, 'id' | 'createdAt' | 'updatedAt' | 'version'>): Promise<KnowledgeDocument> {
-    const newDoc: KnowledgeDocument = {
-      id: `doc-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      version: 1,
-      ...doc
-    };
-
-    if (isMySQLConnected) {
-      try {
-        await query(`INSERT INTO knowledge_documents (id, title, clientId, environment, type, category, criticality, tags, status, content, createdAt, updatedAt, version) 
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [newDoc.id, newDoc.title, newDoc.clientId || null, newDoc.environment || null, newDoc.type, newDoc.category, newDoc.criticality, newDoc.tags.join(','), newDoc.status, newDoc.content, newDoc.createdAt, newDoc.updatedAt, newDoc.version]
-        );
-      } catch (e) {
-        console.error('MySQL insertKnowledgeDoc fail, using local state fallback.', e);
-      }
-    }
-
-    this.state.knowledge_documents.unshift(newDoc);
-    this.save();
-    return newDoc;
+    return this.createKnowledgeDoc(doc);
   }
 
   public async insertKnowledgeConflict(conflict: Omit<KnowledgeConflict, 'id' | 'observedAt' | 'status'>): Promise<KnowledgeConflict> {
@@ -632,66 +661,27 @@ class SimulatedDatabase {
           [newConflict.id, newConflict.documentId, newConflict.fieldName, newConflict.documentedValue, newConflict.documentedOrigin, newConflict.observedValue, newConflict.observedOrigin, newConflict.observedAt, newConflict.status]
         );
       } catch (e) {
-        console.error('MySQL insertKnowledgeConflict fail, using local state fallback.', e);
+        console.error('MySQL insertKnowledgeConflict fail:', e);
       }
     }
 
     this.state.knowledge_conflicts.unshift(newConflict);
-    this.save();
     return newConflict;
   }
 
   public async resolveKnowledgeConflict(conflictId: string, action: 'keep' | 'update' | 'reject'): Promise<boolean> {
-    const conflict = this.state.knowledge_conflicts.find(c => c.id === conflictId);
-    if (!conflict) return false;
-
-    conflict.status = 'RESOLVED';
-
     if (isMySQLConnected) {
       try {
         await query('UPDATE knowledge_conflicts SET status = "RESOLVED" WHERE id = ?', [conflictId]);
       } catch (e) {
-        console.error('MySQL resolveKnowledgeConflict fail, using local state fallback.', e);
+        console.error('MySQL resolveKnowledgeConflict fail:', e);
       }
     }
 
-    if (action === 'update') {
-      const doc = this.state.knowledge_documents.find(d => d.id === conflict.documentId);
-      if (doc) {
-        // Implement field replacement
-        if (conflict.fieldName === 'internalIp') {
-          const asset = this.state.assets.find(a => a.hostname === doc.title.match(/APP\d+|DB\d+/)?.[0]);
-          if (asset) {
-            asset.internalIp = conflict.observedValue;
-            asset.lastValidation = new Date().toISOString();
-
-            if (isMySQLConnected) {
-              try {
-                await query('UPDATE assets SET internalIp = ?, lastValidation = ? WHERE id = ?', 
-                  [conflict.observedValue, asset.lastValidation, asset.id]
-                );
-              } catch (e) {
-                console.error('MySQL asset update fail.', e);
-              }
-            }
-          }
-        }
-        doc.updatedAt = new Date().toISOString();
-        doc.version += 1;
-
-        if (isMySQLConnected) {
-          try {
-            await query('UPDATE knowledge_documents SET updatedAt = ?, version = ? WHERE id = ?', 
-              [doc.updatedAt, doc.version, doc.id]
-            );
-          } catch (e) {
-            console.error('MySQL document update fail.', e);
-          }
-        }
-      }
+    const conflict = this.state.knowledge_conflicts.find(c => c.id === conflictId);
+    if (conflict) {
+      conflict.status = 'RESOLVED';
     }
-
-    this.save();
     return true;
   }
 
@@ -709,158 +699,74 @@ class SimulatedDatabase {
           [newFile.id, newFile.fileName, newFile.fileSize, newFile.category, newFile.status, newFile.content, newFile.uploadedAt, newFile.autoExtractedMetadata ? JSON.stringify(newFile.autoExtractedMetadata) : null]
         );
       } catch (e) {
-        console.error('MySQL insertRepositoryFile fail, using local state fallback.', e);
+        console.error('MySQL insertRepositoryFile fail:', e);
       }
     }
 
     this.state.repository_files.push(newFile);
-    this.save();
     return newFile;
   }
 
   public async approveIngestedMetadata(fileId: string): Promise<boolean> {
-    const file = this.state.repository_files.find(f => f.id === fileId);
+    const files = await this.getRepositoryFiles();
+    const file = files.find(f => f.id === fileId);
     if (!file || !file.autoExtractedMetadata) return false;
 
     const metadata = file.autoExtractedMetadata;
+    const existingClients = await this.getClients();
 
-    // Persist discovered clients if not exists
+    // 1. Persist real clients extracted from file
+    let targetClient: Client | null = null;
     for (const cName of metadata.clients) {
-      const exists = this.state.clients.some(c => c.name.toLowerCase() === cName.toLowerCase() || c.code.toLowerCase() === cName.toLowerCase());
-      if (!exists) {
+      let client = existingClients.find(c => c.name.toLowerCase() === cName.toLowerCase() || c.code.toLowerCase() === cName.toLowerCase());
+      if (!client) {
         const code = cName.toUpperCase().replace(/\s+/g, '_');
-        const newClient: Client = {
-          id: `cli-${Date.now()}-${Math.floor(Math.random() * 100)}`,
+        client = await this.createClient({
           name: cName,
           code,
-          domain: `${code.toLowerCase()}.ibrcloud.com`,
+          domain: `${code.toLowerCase()}.ibrcloud.com.br`,
           criticality: 'MEDIUM',
           status: 'ACTIVE',
-          sla_hours: 4,
-          createdAt: new Date().toISOString()
-        };
-        
-        if (isMySQLConnected) {
-          try {
-            await query(`INSERT INTO clients (id, name, code, domain, criticality, status, sla_hours, createdAt) 
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-              [newClient.id, newClient.name, newClient.code, newClient.domain, newClient.criticality, newClient.status, newClient.sla_hours, newClient.createdAt]
-            );
-          } catch (e) {
-            console.error('MySQL client insertion failed.', e);
-          }
-        }
-        this.state.clients.push(newClient);
+          sla_hours: 4
+        });
       }
+      if (!targetClient) targetClient = client;
     }
 
-    // Locate or create the correct client association
-    const defaultClient = this.state.clients.find(c => metadata.clients.some(mc => mc.toLowerCase().includes(c.name.toLowerCase()) || c.name.toLowerCase().includes(mc.toLowerCase()))) || this.state.clients[0];
+    if (!targetClient && existingClients.length > 0) {
+      targetClient = existingClients[0];
+    }
 
-    // Persist discovered assets
+    // 2. Persist real assets extracted from file
+    const existingAssets = await this.getAssets();
     for (const newAsset of metadata.assets) {
-      const exists = this.state.assets.find(a => a.hostname === newAsset.hostname && a.clientId === defaultClient.id);
-      if (exists) {
-        // Check for conflicts
-        if (newAsset.internalIp && exists.internalIp !== newAsset.internalIp) {
-          await this.insertKnowledgeConflict({
-            documentId: 'doc-2', // Linked to topology config doc
-            fieldName: 'internalIp',
-            documentedValue: exists.internalIp,
-            documentedOrigin: 'MySQL Database System',
-            observedValue: newAsset.internalIp,
-            observedOrigin: `Ingestão de arquivo: ${file.fileName}`
-          });
-        } else {
-          // Normal validation
-          exists.lastValidation = new Date().toISOString();
-          if (isMySQLConnected) {
-            try {
-              await query('UPDATE assets SET lastValidation = ? WHERE id = ?', [exists.lastValidation, exists.id]);
-            } catch (e) {
-              console.error('MySQL asset validation update fail.', e);
-            }
-          }
-        }
-      } else {
-        // Create new asset
-        const createdAsset: Asset = {
-          id: `ast-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-          clientId: defaultClient.id,
-          datacenter: 'Canadá (OVH)',
-          environment: 'PRODUCTION',
-          type: newAsset.type || 'VM',
-          hostname: newAsset.hostname || 'NEW_HOST',
-          displayName: `${defaultClient.code} ${newAsset.hostname || 'New Asset'}`,
-          internalIp: newAsset.internalIp || '192.168.10.254',
-          externalIp: '198.50.120.' + Math.floor(Math.random() * 200 + 10),
-          operatingSystem: newAsset.operatingSystem || 'AlmaLinux 9',
-          version: '9.4',
-          criticality: 'MEDIUM',
-          status: 'ACTIVE',
-          lastDiscovery: new Date().toISOString(),
-          lastValidation: new Date().toISOString()
-        };
-
-        if (isMySQLConnected) {
-          try {
-            await query(`INSERT INTO assets (id, clientId, datacenter, environment, type, hostname, displayName, internalIp, externalIp, operatingSystem, version, status, lastDiscovery, lastValidation) 
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-              [createdAsset.id, createdAsset.clientId, createdAsset.datacenter, createdAsset.environment, createdAsset.type, createdAsset.hostname, createdAsset.displayName, createdAsset.internalIp, createdAsset.externalIp, createdAsset.operatingSystem, createdAsset.version, createdAsset.status, createdAsset.lastDiscovery, createdAsset.lastValidation]
-            );
-          } catch (e) {
-            console.error('MySQL asset creation failed.', e);
-          }
-        }
-        this.state.assets.push(createdAsset);
+      if (!newAsset.hostname) continue;
+      const found = existingAssets.find(a => a.hostname.toLowerCase() === newAsset.hostname!.toLowerCase());
+      if (!found && targetClient) {
+        await this.createAsset({
+          clientId: targetClient.id,
+          datacenter: newAsset.datacenter || 'Infraestrutura Real',
+          environment: newAsset.environment || 'PRODUCTION',
+          type: newAsset.type || 'SERVER',
+          hostname: newAsset.hostname,
+          displayName: newAsset.displayName || newAsset.hostname,
+          internalIp: newAsset.internalIp || '',
+          externalIp: newAsset.externalIp || '',
+          operatingSystem: newAsset.operatingSystem || 'Linux',
+          version: newAsset.version || '',
+          criticality: newAsset.criticality || 'MEDIUM',
+          status: 'ACTIVE'
+        });
       }
     }
 
-    // Generate connections
-    for (const rel of metadata.relationships) {
-      const srcAsset = this.state.assets.find(a => a.hostname === rel.sourceAssetId);
-      const tgtAsset = this.state.assets.find(a => a.hostname === rel.targetAssetId);
-      if (srcAsset && tgtAsset) {
-        const relationshipExists = this.state.asset_relationships.some(
-          r => r.sourceAssetId === srcAsset.id && r.targetAssetId === tgtAsset.id && r.type === rel.type
-        );
-        if (!relationshipExists) {
-          const newRel: AssetRelationship = {
-            id: `rel-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-            sourceAssetId: srcAsset.id,
-            targetAssetId: tgtAsset.id,
-            type: rel.type || 'DEPENDS_ON',
-            origin: 'DISCOVERY',
-            status: 'ACTIVE'
-          };
-
-          if (isMySQLConnected) {
-            try {
-              await query('INSERT INTO asset_relationships (id, sourceAssetId, targetAssetId, type, origin, status) VALUES (?, ?, ?, ?, ?, ?)',
-                [newRel.id, newRel.sourceAssetId, newRel.targetAssetId, newRel.type, newRel.origin, newRel.status]
-              );
-            } catch (e) {
-              console.error('MySQL relationship insertion failed.', e);
-            }
-          }
-          this.state.asset_relationships.push(newRel);
-        }
-      }
-    }
-
-    file.status = 'PROCESSED';
+    // 3. Mark file as PROCESSED in MySQL
     if (isMySQLConnected) {
-      try {
-        await query('UPDATE repository_files SET status = "PROCESSED" WHERE id = ?', [fileId]);
-      } catch (e) {
-        console.error('MySQL file processed update failed.', e);
-      }
+      await query('UPDATE repository_files SET status = "PROCESSED" WHERE id = ?', [fileId]);
     }
-
-    this.save();
     return true;
   }
 }
 
-export const db = new SimulatedDatabase();
+export const db = new MySQLDatabaseManager();
 export { isMySQLConnected };
