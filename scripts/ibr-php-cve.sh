@@ -738,6 +738,8 @@ build_opts() {  # porta
   OPTS=(-p "$1" -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=6
         -o PasswordAuthentication=no -o StrictHostKeyChecking="$SHK" -o LogLevel=ERROR)
   if [ -n "$HOSTKEY" ]; then OPTS+=(-i "$HOSTKEY" -o IdentitiesOnly=yes); fi
+  # enroll: ignora ~/.ssh/config (IdentityFile por host la dentro faria a chave ANTIGA passar no teste da nova)
+  if [ "${ISOLATE:-0}" = 1 ]; then OPTS+=(-F /dev/null); fi
 }
 clean_msg() { tr -d '\r' | tr -cd '[:print:]\n' | grep -v '^[[:space:]]*$' | tail -n1 | cut -c1-110; }
 probe_access() {  # ip porta -> ACC_USER ACC_SUDO ACC_ERR
@@ -810,6 +812,7 @@ enroll_flow() {
   fi
   [ -f "$k.pub" ] || ssh-keygen -y -f "$k" > "$k.pub" || die "sem chave publica"
   ssh-add "$k" 2>/dev/null || true
+  ISOLATE=1
   pub="$k.pub"
   log "enroll: cadastrando $(ssh-keygen -lf "$pub" | cut -d' ' -f1-2) | usuarios: $USERS"
   for h in "${HOSTS[@]}"; do
@@ -819,7 +822,7 @@ enroll_flow() {
     if [ "$ACC_KIND" != denied ]; then log "$name: PULADO - $ACC_ERR"; n_skip=$((n_skip+1)); continue; fi
     ok=0; via=()
     vkey="${KEYMAP[$(echo "$name" | tr 'A-Z' 'a-z')]:-${KEYMAP[$(echo "$target" | tr 'A-Z' 'a-z')]:-$ENROLL_VIA}}"
-    if [ -n "$vkey" ]; then via=(-o "IdentityFile=${vkey/#\~/$HOME}" -o IdentitiesOnly=yes); fi
+    if [ -n "$vkey" ]; then via=(-f -o "IdentityFile=${vkey/#\~/$HOME}" -o IdentitiesOnly=yes); fi
     for u in ${USERS//,/ }; do
       log "$name ($target:$port): instalando a chave para o usuario $u ..."
       ssh-copy-id -i "$pub" -p "$port" -o StrictHostKeyChecking="$SHK" -o ConnectTimeout=8 -o NumberOfPasswordPrompts=1 "${via[@]}" "$u@$target"
