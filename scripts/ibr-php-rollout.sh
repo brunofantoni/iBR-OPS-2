@@ -128,7 +128,7 @@ SITES_B="$OUT/2-sites-antes/sites.tsv"
 NOACC=$(awk -F'\t' 'NR>1 && $7=="SEM_ACESSO"{print $1}' "$SUM")
 IOCH=$(awk -F'\t' 'NR>1 && $7!="SEM_ACESSO" && ($9>0 || $10>0 || $12>0){print $1}' "$SUM")
 PATCHC=$(awk -F'\t' 'NR>1 && $7 ~ /^(VULNERABLE|NEEDS_BACKPORT)$/{print $1}' "$SUM")
-MITC=$(awk -F'\t' 'NR>1 && $7 ~ /^(NEEDS_BACKPORT|EOL_NO_FIX)$/{print $1}' "$SUM")
+MITC=$(awk -F'\t' 'NR>1 && $7 ~ /^(VULNERABLE|NEEDS_BACKPORT|EOL_NO_FIX)$/{print $1}' "$SUM")
 
 PATCH_SET=(); BLOCK_IOC=(); BLOCK_W008=(); MIT_SET=()
 for h in $PATCHC; do
@@ -187,7 +187,7 @@ declare -A PRES=()
 addres() { PRES[$1]="${PRES[$1]:+${PRES[$1]} ; }$2"; }
 
 patch_ok() {  # host fase -> 0 se o ibr-php-cve registrou PATCH OK/NOOP
-  grep -qE '^PATCH\|(OK|OK_STILL_VULNERABLE|NOOP)\|' "$OUT/$2/raw/$1.txt" 2>/dev/null
+  grep -qE '^PATCH\|(OK|OK_STILL_VULNERABLE|NOOP|MANUAL)\|' "$OUT/$2/raw/$1.txt" 2>/dev/null
 }
 
 if [ "$APPLY" = 1 ]; then
