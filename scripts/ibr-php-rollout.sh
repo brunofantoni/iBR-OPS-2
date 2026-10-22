@@ -292,7 +292,7 @@ fi
 # ---------------------------------------------------------------------------
 REP="$OUT/relatorio.md"; PEND="$OUT/pendencias.tsv"
 count_status() {  # sites.tsv hosts_csv
-  awk -F'\t' -v hs=",$2," 'NR>1 && index(hs, "," $1 ",")>0 && $2 !~ /^(cpanel|mail|webmail)\./ && $2 !~ /(dummy-host|example\.com)/ {
+  awk -F'\t' -v hs=",$2," 'NR>1 && index(hs, "," $1 ",")>0 && $2 !~ /^(cpanel|mail|webmail)\./ && $2 !~ /(dummy-host|example\.com)/ && $6!="N/A" {
          s=$6; if(s=="?" || $7 ~ /^versao nao detectada/) s="NAO_DETECTADA"; c[s]++ }
        END{for(k in c) printf "%s\t%d\n", k, c[k]}' "$1" | sort
 }
@@ -377,7 +377,7 @@ ALL_CSV=$(awk -F'\t' 'NR>1{print $1}' "$SITES_B" | sort -u | to_csv)
     awk -F'\t' -v hs=",$(printf '%s\n' "${CHANGED[@]}" | sort -u | to_csv)," 'NR>1 && index(hs, "," $1 ",")==0' "$SITES_B"
   else
     awk -F'\t' 'NR>1' "$SITES_B"
-  fi | awk -F'\t' '$2 !~ /^(cpanel|mail|webmail)\./ && $2 !~ /(dummy-host|example\.com)/ && $6 !~ /^FIXED/ && $6 != "" '
+  fi | awk -F'\t' '$2 !~ /^(cpanel|mail|webmail)\./ && $2 !~ /(dummy-host|example\.com)/ && $6 !~ /^FIXED/ && $6 != "" && $6 != "N/A" '
 } > "$PEND"
 N_PEND=$(awk -F'\t' 'NR>1' "$PEND" | wc -l | tr -d ' ')
 

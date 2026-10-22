@@ -616,6 +616,11 @@ do_sites() {
     emit SITE "$dom" "$usr" "$ver" "$doc" "$app"
   done
   rm -f "$tmp"
+  # pools php-fpm EM EXECUCAO: nome do pool -> executavel real (verdade de runtime, independe do painel)
+  ps -eo pid=,args= 2>/dev/null | awk '/php-fpm: pool /{print $1 " " $NF}' | sort -u | while read -r pid pool; do
+    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null); exe=${exe% (deleted)}
+    [ -n "$exe" ] && echo "$pool|$exe"
+  done | sort -u | while IFS='|' read -r pool exe; do emit PFPOOL "$pool" "$exe"; done
 }
 
 # ---------- main remoto ----------
@@ -867,15 +872,26 @@ if [ "$MODE" = sites ]; then
     n=${h%%|*}; raw="$OUT/raw/$n.txt"; [ -s "$raw" ] || continue
     awk -F'|' -v n="$n" '
       function rk(s){ if(s=="VULNERABLE"||s=="EOL_NO_FIX")return 6; if(s=="NEEDS_BACKPORT")return 5; if(s ~ /^UNKNOWN/)return 4; if(s ~ /^FIXED/)return 1; return 3 }
-      $1=="BIN" { v=$4; split(v,p,"."); br=p[1] "." p[2]
-        if(!(br in rv) || rk($7)>rk(rs[br])){ rv[br]=v; rs[br]=$7 } }
-      $1=="SITE" { v=$4; sub(/\(pool\)/,"",v); split(v,q,","); real="-"; st="SEM_BINARIO_CASADO"; ac="verificar"
-        split(q[1],bb,"."); b=bb[1] "." bb[2]
-        if(b in rv){ real=rv[b]; st=rs[b] }
-        if(st ~ /^FIXED/) ac="ok"; else if(st=="VULNERABLE") ac="atualizar build (mesma serie) ou migrar p/ 8.3.36+"
-        else if(st=="NEEDS_BACKPORT"||st=="EOL_NO_FIX") ac="MIGRAR p/ 8.3.36+ (sem correcao oficial)"
-        else if($4=="?") { ac="versao nao detectada: conferir no painel"; st="?" }
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n,$2,$3,$4,real,st,ac,$6,$5 }' "$raw" >> "$SITES"
+      function br(v,  a){ split(v,a,"."); return a[1] "." a[2] }
+      $1=="BIN" { pv[$2]=$4; pst[$2]=$7; b=br($4); if(!(b in rv) || rk($7)>rk(rs[b])){ rv[b]=$4; rs[b]=$7 } }
+      $1=="PFPOOL" { pe[$2]=(pe[$2]==""?$3:pe[$2] "," $3) }
+      $1=="SITE" { dom=$2; usr=$3; v=$4; doc=$5; app=$6; sub(/\(pool\)/,"",v)
+        real="-"; st="SEM_BINARIO_CASADO"; ac="verificar"; shown=$4; src=""
+        if (usr in pe) {   # runtime: binario do pool php-fpm que atende esse usuario
+          m=split(pe[usr],ex,","); worst=0; vs=""
+          for(k=1;k<=m;k++){ if(ex[k] in pv){ vv=pv[ex[k]]; if(rk(pst[ex[k]])>worst){worst=rk(pst[ex[k]]); st=pst[ex[k]]}; vs=vs (vs==""?"":",") vv } }
+          if(vs!=""){ real=vs; shown=br(split_first(vs)) "(run)" }
+        } else if (v!="?" && v!="") {
+          split(v,q,","); b=br(q[1]); if(b in rv){ real=rv[b]; st=rs[b] }
+        }
+        if (dom ~ /^(cpanel|mail|webmail|whm|webdisk|autodiscover|autoconfig|cpcalendars|cpcontacts)\./) { st="N/A"; ac="ignorar (subdominio de servico)" }
+        else if (doc ~ /suspended-page/) { st="N/A"; ac="ignorar (conta suspensa)" }
+        else if (st ~ /^FIXED/) ac="ok"
+        else if (st=="VULNERABLE") ac="atualizar build (mesma serie) ou migrar p/ 8.3.36+"
+        else if (st=="NEEDS_BACKPORT"||st=="EOL_NO_FIX") ac="MIGRAR p/ 8.3.36+ (sem correcao oficial)"
+        else if (!(usr in pe) && (v=="?"||v=="")) { st="?"; ac="sem pool php-fpm ativo: PHP padrao do servidor ou site sem trafego (verificar)" }
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n,dom,usr,shown,real,st,ac,app,doc }
+      function split_first(x,  a){ split(x,a,","); return a[1] }' "$raw" >> "$SITES"
   done
   echo
   if command -v column >/dev/null 2>&1; then column -t -s$'\t' "$SITES" | cut -c1-260; else cat "$SITES"; fi
