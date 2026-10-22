@@ -126,8 +126,8 @@ GUIO006|10.110.0.16|6650|run|
 GUIO007|10.110.0.17|6650|run|
 HD1WEB2C-NEW|192.99.229.4|6650|explicit|fingerprint SSH divergente: conferir por canal confiavel antes de qualquer coisa
 WEB021-PREVMOC|192.99.229.7|6650|run|
-IP-51-222-69-72|51.222.69.72|6650|run|
-HD1WEB2|51.222.69.73|6650|explicit|= IP-51-222-69-73 do inventario (hd1web2, confirmado pelo Bruno); timeout na 6650 em 22/10 15:02
+HD1WEB1|51.222.69.72|6650|run|hd1web1.hdlao.com = 51.222.69.72 (DNS)|hd1web1.hdlao.com
+HD1WEB2|51.222.69.73|6650|explicit|= IP-51-222-69-73 do inventario (hd1web2, confirmado pelo Bruno); timeout na 6650 em 22/10 15:02|hd1web2.hdlao.com
 IP-51-222-69-74|51.222.69.74|6650|run|
 IP-51-222-69-75|51.222.69.75|6650|run|so chave publica
 IP-51-222-69-76|51.222.69.76|6650|run|so chave publica
