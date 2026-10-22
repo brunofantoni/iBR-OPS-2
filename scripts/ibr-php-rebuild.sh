@@ -154,10 +154,11 @@ case "$MODE" in
     log "build iniciado em segundo plano. Acompanhando (Ctrl-C nao interrompe o build; use 'status' depois)."
     sleep 10
     while :; do
-      S=$("${SSH[@]}" "sudo cat /opt/ibr-build/$(basename "$DIR")-$PV/STATUS 2>/dev/null" 2>/dev/null)
+      PCMD='W=/opt/ibr-build/'"$TGT"'; S=$(cat $W/STATUS 2>/dev/null); exec 9>$W/.lock; if flock -n 9; then echo "$S"; else echo RUNNING; fi'
+      S=$("${SSH[@]}" "sudo bash -c $(printf %q "$PCMD")" 2>/dev/null)
       case "$S" in
         OK) log "BUILD OK. Revise: status; depois, na janela: swap"; exit 0 ;;
-        FAIL*) log "BUILD FALHOU: $S"; "${SSH[@]}" "sudo tail -n 25 /opt/ibr-build/$(basename "$DIR")-$PV/build.log" 2>/dev/null; exit 1 ;;
+        FAIL*) log "BUILD FALHOU: $S"; "${SSH[@]}" "sudo tail -n 25 /opt/ibr-build/$TGT/build.log; echo '--- erros do make (primeiros) ---'; sudo grep -nE 'error|Error [0-9]|No space|Killed|internal compiler' /opt/ibr-build/$TGT/make.out | head -12; echo '--- memoria ---'; free -m | sed -n 1,2p; sudo dmesg -T 2>/dev/null | grep -iE 'out of memory|killed process' | tail -3" 2>/dev/null; exit 1 ;;
         *) log "em andamento ..."; sleep 30 ;;
       esac
     done ;;
