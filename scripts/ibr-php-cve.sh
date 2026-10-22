@@ -250,7 +250,8 @@ scan_bins() {  # $1 = rotulo da fase
   fi
   {
     find /usr/bin /usr/sbin /usr/local /opt /srv /home /var/www -maxdepth 8 -type f -perm -u+x \
-      \( -name 'php' -o -name 'php[0-9]*' -o -name 'php-fpm*' -o -name 'php-cgi*' -o -name 'lsphp*' -o -name 'frankenphp' \) 2>/dev/null
+      \( -name 'php' -o -name 'php[0-9]*' -o -name 'php-fpm*' -o -name 'php-cgi*' -o -name 'lsphp*' -o -name 'frankenphp' \) \
+      ! -name '*.php' ! -name '*.phtml' ! -name '*.inc' ! -name '*.y' ! -name '*.json' ! -name '*.md' ! -name '*.txt' ! -name '*.ini' ! -name '*.conf' ! -name '*.so' ! -name '*.stub' 2>/dev/null
     find /usr/lib /usr/lib64 /usr/libexec /opt -maxdepth 8 -type f -path '*/modules/*' -name 'libphp*.so' 2>/dev/null
     cat "$SERV"
   } | while IFS= read -r l; do
