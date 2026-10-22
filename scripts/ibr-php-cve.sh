@@ -27,7 +27,9 @@
 #    --include-skipped     inclui hosts marcados 'skip' (AD, VPN, HD-*, DESKTOP)
 #    --canary              executa apenas no primeiro host selecionado
 #    --user U[,U2]         usuarios SSH em ordem (padrao: infrabrasil,ibrcloud)
-#    --key PATH            chave privada (ou use ssh-agent)
+#    --key PATH            chave privada unica para todos (ou use ssh-agent)
+#    --keymap FILE         chave por host: linhas NOME_OU_IP|/caminho/chave (prevalece sobre --key).
+#                          Necessario porque o ssh_config casa por NOME digitado, nao por IP.
 #    --trust-new-hostkeys  aceita host keys NOVAS (accept-new). Chave ALTERADA
 #                          continua sendo recusada, sempre.
 #    --since YYYY-MM-DD    corte para IOC (padrao 2026-10-17, 1o ataque conhecido)
@@ -64,6 +66,7 @@ MODE="discover"
 APPLY=0; YES=0; ONLY=""; INC_EXPL=0; INC_SKIP=0; CANARY=0
 USERS="${IBR_SSH_USERS:-infrabrasil,ibrcloud}"
 KEY="${IBR_SSH_KEY:-}"
+KEYMAP_FILE=""
 SHK="yes"
 SINCE="2026-10-17"
 PAR=6
@@ -557,6 +560,7 @@ while [ $# -gt 0 ]; do
     --canary) CANARY=1 ;;
     --user|--users) USERS="$2"; shift ;;
     --key) KEY="$2"; shift ;;
+    --keymap) KEYMAP_FILE="$2"; shift ;;
     --trust-new-hostkeys) SHK="accept-new" ;;
     --since) SINCE="$2"; shift ;;
     --parallel) PAR="$2"; shift ;;
@@ -626,13 +630,25 @@ fi
 
 # ---- acesso ----
 OPTS=()
-build_opts() {
+HOSTKEY=""
+declare -A KEYMAP=()
+if [ -n "$KEYMAP_FILE" ]; then
+  [ -r "$KEYMAP_FILE" ] || die "keymap ilegivel: $KEYMAP_FILE"
+  while IFS='|' read -r km_name km_path; do
+    case "$km_name" in ''|'#'*) continue ;; esac
+    km_path="${km_path/#\~/$HOME}"
+    [ -r "$km_path" ] || echo "AVISO: chave do keymap nao encontrada: $km_path ($km_name)" >&2
+    KEYMAP[$(echo "$km_name" | tr 'A-Z' 'a-z')]="$km_path"
+  done < "$KEYMAP_FILE"
+fi
+build_opts() {  # porta
   OPTS=(-p "$1" -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=6
         -o PasswordAuthentication=no -o StrictHostKeyChecking="$SHK" -o LogLevel=ERROR)
-  if [ -n "$KEY" ]; then OPTS+=(-i "$KEY" -o IdentitiesOnly=yes); fi
+  if [ -n "$HOSTKEY" ]; then OPTS+=(-i "$HOSTKEY" -o IdentitiesOnly=yes); fi
 }
+clean_msg() { tr -d '\r' | tr -cd '[:print:]\n' | grep -v '^[[:space:]]*$' | tail -n1 | cut -c1-110; }
 probe_access() {  # ip porta -> ACC_USER ACC_SUDO ACC_ERR
-  local u out rc
+  local u out rc msg
   ACC_USER=""; ACC_SUDO=""; ACC_ERR=""
   build_opts "$2"
   for u in ${USERS//,/ }; do
@@ -640,9 +656,15 @@ probe_access() {  # ip porta -> ACC_USER ACC_SUDO ACC_ERR
     if [ $rc -eq 0 ] && grep -q '^SUDO=' <<<"$out"; then
       ACC_USER="$u"; ACC_SUDO=$(grep '^SUDO=' <<<"$out" | head -n1 | cut -d= -f2); return 0
     fi
-    ACC_ERR=$(tail -n1 <<<"$out" | tr '|\n' '/ ' | cut -c1-160)
+    msg=$(clean_msg <<<"$out")
     case "$out" in
-      *"timed out"*|*"No route"*|*"refused"*|*"IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*|*"Could not resolve"*) return 1 ;;
+      *"IDENTIFICATION HAS CHANGED"*) msg="CHAVE DO HOST ALTERADA: nao conectar, verificar por canal confiavel" ;;
+      *"host key is known"*|*"Host key verification failed"*) msg="host key ausente no known_hosts para este IP:porta (use --trust-new-hostkeys)" ;;
+      *"Permission denied"*) msg="$u: chave nao autorizada (metodos: $(grep -o '(.*)' <<<"$out" | tr -cd '[:print:]' | head -n1))" ;;
+    esac
+    ACC_ERR="${ACC_ERR:+$ACC_ERR; }$msg"
+    case "$out" in
+      *"timed out"*|*"No route"*|*"refused"*|*"IDENTIFICATION HAS CHANGED"*|*"host key is known"*|*"Host key verification failed"*|*"Could not resolve"*) return 1 ;;
     esac
   done
   return 1
@@ -652,6 +674,8 @@ process_host() {
   local line="$1" name ip port flag note raw
   IFS='|' read -r name ip port flag note <<<"$line"
   raw="$OUT/raw/$name.txt"
+  local lcn; lcn=$(echo "$name" | tr 'A-Z' 'a-z')
+  HOSTKEY="${KEYMAP[$lcn]:-${KEYMAP[$ip]:-$KEY}}"
   if ! probe_access "$ip" "$port"; then
     echo "FAIL|${ACC_ERR:-sem resposta}" > "$OUT/raw/$name.access"; : > "$raw"
     log "$name ($ip:$port): SEM ACESSO - ${ACC_ERR:-sem resposta}"; return 2
@@ -705,7 +729,7 @@ printf 'HOST\tIP\tACESSO\tIP_PUBLICO\tPORTAS_WEB\tPHP_SERVINDO\tSTATUS_CVE\tSTAL
 for h in "${HOSTS[@]}"; do
   IFS='|' read -r name ip port flag note <<<"$h"
   raw="$OUT/raw/$name.txt"; acc="SEM_ARQUIVO"
-  [ -f "$OUT/raw/$name.access" ] && acc=$(cut -d'|' -f1-3 "$OUT/raw/$name.access" | tr '| ' ':_')
+  [ -f "$OUT/raw/$name.access" ] && acc=$(cut -d'|' -f1-3 "$OUT/raw/$name.access" | tr -cd '[:print:]' | tr '| ' ':_' | cut -c1-48)
   if [ "${acc%%:*}" != OK ]; then
     printf '%s\t%s\t%s\t-\t-\t-\tSEM_ACESSO\t-\t-\t-\t-\t-\t-\n' "$name" "$ip" "$acc" >> "$SUMMARY"; continue
   fi
@@ -746,7 +770,7 @@ echo "Arquivos: $SUMMARY  $IOCF  $OUT/raw/"
 case "$MODE" in
   discover)
     echo "IOC e heuristica: arquivo .php novo pode ser deploy legitimo. Se houver SUSPECT/IOC_PROC em host publico, trate como incidente ANTES de patchear (preserve evidencias)."
-    [ "$n_vuln" -gt 0 ] && echo "Proximo passo: ./$(basename "$0") patch --apply --canary --no-snapshot --only <host>   (EOL/backport: mitigate + isolamento)" ;;
+    [ "$n_vuln" -gt 0 ] && echo "Proximo passo: $0 patch --apply --canary --no-snapshot --only <host>   (EOL/backport: mitigate + isolamento)" ;;
   mitigate) echo "Mitigacao e provisoria e NAO corrige o CVE. Faca o patch e depois 'unmitigate'." ;;
 esac
 [ "$STATUS" -ne 0 ] && exit "$STATUS"
