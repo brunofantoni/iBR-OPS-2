@@ -12,6 +12,8 @@
 #    discover    (padrao) SOMENTE LEITURA. Para cada host: binarios PHP, SAPI,
 #                quem esta servindo de fato, status do CVE, ini efetivo,
 #                containers com PHP e indicios de comprometimento (IOC).
+#    sites       SOMENTE LEITURA. Lista cada site (dominio, usuario, docroot, app) com a
+#                versao de PHP que ele usa e o status do CVE dessa versao -> sites.tsv.
 #    mitigate    Mitigacao provisoria (session.upload_progress.enabled=0) via
 #                drop-in de ini + reload. NAO corrige o CVE.        [--apply]
 #    unmitigate  Remove o drop-in da mitigacao.                     [--apply]
@@ -555,12 +557,74 @@ patch_rollback() {
   esac
 }
 
+# ---------- sites: dominio -> versao de PHP (somente leitura) ----------
+do_sites() {
+  local tmp; tmp=$(mktemp)
+  # cPanel/WHM: fonte oficial
+  if command -v whmapi1 >/dev/null 2>&1; then
+    whmapi1 php_get_vhost_versions 2>/dev/null | awk '
+      function flush(){ if(vh!=""){ v=ver; sub(/^ea-php/,"",v); if(v ~ /^[0-9][0-9]$/) v=substr(v,1,1) "." substr(v,2); printf "%s|%s|%s|-|whmapi\n", vh, ac, v } vh=""; ac=""; ver="" }
+      /^[ ]*- [a-z_]+:/ { flush() }
+      { line=$0; sub(/^[ ]*- /,"",line); sub(/^[ ]+/,"",line); k=line; sub(/:.*/,"",k); val=line; sub(/^[^:]*:[ ]*/,"",val)
+        if(k=="vhost")vh=val; else if(k=="account")ac=val; else if(k=="version")ver=val }
+      END{flush()}' >> "$tmp"
+  fi
+  # vhosts de Apache/nginx (CWP e outros): ServerName + DocumentRoot + socket php-fpmNN
+  local dirs="" d f
+  for d in /usr/local/apache/conf.d /usr/local/apache/conf /etc/httpd/conf.d /etc/httpd/conf /etc/apache2 /etc/nginx /usr/local/nginx/conf /usr/local/cwp/.conf; do [ -d "$d" ] && dirs="$dirs $d"; done
+  if [ -n "$dirs" ]; then
+    # shellcheck disable=SC2086
+    grep -rIlE 'ServerName|server_name' $dirs 2>/dev/null | head -n 3000 | while IFS= read -r f; do
+      awk -v f="$f" '
+        function usr(p){ if(p ~ /^\/home[0-9]*\//){ split(p,a,"/"); return a[3] } return "-" }
+        function flush(){ if(dom!=""&&dom!="_"&&dom!="localhost"&&dom!="default"&&dom !~ /^[0-9.]+$/){ printf "%s|%s|%s|%s|%s\n", dom, usr(doc), (ver==""?"?":ver), doc, f } dom=""; doc=""; ver="" }
+        /<VirtualHost/ || /^[ \t]*server[ \t]*\{/ { flush() }
+        tolower($1)=="servername" { dom=$2 }
+        $1=="server_name" { dom=$2; sub(/;/,"",dom) }
+        tolower($1)=="documentroot" { doc=$2; gsub(/"|;/,"",doc) }
+        $1=="root" { doc=$2; sub(/;/,"",doc) }
+        match($0,/php-fpm[0-9][0-9]/) { d=substr($0,RSTART+7,2); ver=substr(d,1,1) "." substr(d,2,1) }
+        match($0,/ea-php[0-9][0-9]/) { d=substr($0,RSTART+6,2); ver=substr(d,1,1) "." substr(d,2,1) }
+        match($0,/lsphp[0-9][0-9]/) { d=substr($0,RSTART+5,2); ver=substr(d,1,1) "." substr(d,2,1) }
+        END{flush()}' "$f" 2>/dev/null
+    done >> "$tmp"
+  fi
+  # pools php-fpm por usuario (CWP/alt): usuario -> versao(oes)
+  local pf pv pu
+  for pf in /opt/alt/php-fpm*/usr/etc/php-fpm.d/users/*.conf /opt/alt/php-fpm*/usr/etc/php-fpm.d/*.conf; do
+    [ -f "$pf" ] || continue
+    pv=$(echo "$pf" | sed -n 's#.*/php-fpm\([0-9]\)\([0-9]\)/.*#\1.\2#p')
+    pu=$(sed -n 's/^\[\(.*\)\]$/\1/p' "$pf" | head -n1)
+    [ -n "$pu" ] && [ "$pu" != www ] && echo "POOL|$pu|$pv" >> "$tmp"
+  done
+  # consolida: por dominio, prefere entrada com versao conhecida; versao do pool completa o '?'
+  awk -F'|' '
+    $1=="POOL"{ pv[$2]=(pv[$2]==""?$3:pv[$2] "," $3); next }
+    { dom=$1; if(!(dom in seen)){ order[++n]=dom; seen[dom]=1; usr[dom]=$2; ver[dom]=$3; doc[dom]=$4 }
+      else if(ver[dom]=="?" && $3!="?"){ ver[dom]=$3; if($4!="")doc[dom]=$4; if($2!="-")usr[dom]=$2 }
+      if(usr[dom]=="-" && $2!="-") usr[dom]=$2
+      if(doc[dom]=="" || doc[dom]=="-") doc[dom]=$4 }
+    END{ for(i=1;i<=n;i++){ d=order[i]; v=ver[d]; if(v=="?" && usr[d] in pv) v=pv[usr[d]] "(pool)"; printf "%s|%s|%s|%s\n", d, usr[d], v, doc[d] } }' "$tmp" | sort -u |
+  while IFS='|' read -r dom usr ver doc; do
+    app="-"
+    if [ -n "$doc" ] && [ -f "$doc/wp-includes/version.php" ]; then
+      app="wordpress-$(sed -n "s/^\\\$wp_version *= *'\\([^']*\\)'.*/\\1/p" "$doc/wp-includes/version.php" | head -n1)"
+    elif [ -n "$doc" ] && [ -f "$doc/app/Mage.php" -o -f "$doc/bin/magento" ]; then app=magento
+    elif [ -n "$doc" ] && [ -f "$doc/artisan" ]; then app=laravel
+    elif [ -n "$doc" ] && [ -f "$doc/app/config/paths.php" ]; then app=mautic-ou-symfony
+    fi
+    emit SITE "$dom" "$usr" "$ver" "$doc" "$app"
+  done
+  rm -f "$tmp"
+}
+
 # ---------- main remoto ----------
 emit HOST "$(hostname -f 2>/dev/null || hostname)" "$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")" "$PM" "$ROOT" \
   "$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -Ev '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' | paste -sd, -)" \
   "$(ss -ltn 2>/dev/null | awk 'NR>1{print $4}' | sed 's/.*://' | sort -un | grep -E '^(80|443|8080|8443|2030|2031|2082|2083|2086|2087|2222|10000|8083)$' | paste -sd, -)"
 case "$IBR_MODE" in
   discover)   scan_bins before; scan_containers; scan_ioc ;;
+  sites)      scan_bins before; do_sites ;;
   mitigate)   do_mitigate ;;
   unmitigate) do_unmitigate ;;
   patch)      do_patch ;;
@@ -576,7 +640,7 @@ IBR_REMOTE_PAYLOAD
 die() { echo "ERRO: $*" >&2; exit 1; }
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
 
-[ $# -gt 0 ] && case "$1" in discover|mitigate|unmitigate|patch|enroll) MODE="$1"; shift ;; esac
+[ $# -gt 0 ] && case "$1" in discover|sites|mitigate|unmitigate|patch|enroll) MODE="$1"; shift ;; esac
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
@@ -791,6 +855,32 @@ else
     process_host "$h" &
   done
   wait
+fi
+
+if [ "$MODE" = sites ]; then
+  SITES="$OUT/sites.tsv"
+  printf 'HOST\tDOMINIO\tUSUARIO\tPHP_SITE\tPHP_REAL\tSTATUS_CVE\tACAO\tAPP\tDOCROOT\n' > "$SITES"
+  for h in "${HOSTS[@]}"; do
+    n=${h%%|*}; raw="$OUT/raw/$n.txt"; [ -s "$raw" ] || continue
+    awk -F'|' -v n="$n" '
+      function rk(s){ if(s=="VULNERABLE"||s=="EOL_NO_FIX")return 6; if(s=="NEEDS_BACKPORT")return 5; if(s ~ /^UNKNOWN/)return 4; if(s ~ /^FIXED/)return 1; return 3 }
+      $1=="BIN" { v=$4; split(v,p,"."); br=p[1] "." p[2]
+        if(!(br in rv) || rk($7)>rk(rs[br])){ rv[br]=v; rs[br]=$7 } }
+      $1=="SITE" { v=$4; sub(/\(pool\)/,"",v); split(v,q,","); real="-"; st="SEM_BINARIO_CASADO"; ac="verificar"
+        split(q[1],bb,"."); b=bb[1] "." bb[2]
+        if(b in rv){ real=rv[b]; st=rs[b] }
+        if(st ~ /^FIXED/) ac="ok"; else if(st=="VULNERABLE") ac="atualizar build (mesma serie) ou migrar p/ 8.3.36+"
+        else if(st=="NEEDS_BACKPORT"||st=="EOL_NO_FIX") ac="MIGRAR p/ 8.3.36+ (sem correcao oficial)"
+        else if($4=="?") { ac="versao nao detectada: conferir no painel"; st="?" }
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n,$2,$3,$4,real,st,ac,$6,$5 }' "$raw" >> "$SITES"
+  done
+  echo
+  if command -v column >/dev/null 2>&1; then column -t -s$'\t' "$SITES" | cut -c1-260; else cat "$SITES"; fi
+  echo
+  echo "== RESUMO POR HOST x ACAO =="
+  awk -F'\t' 'NR>1{c[$1 "\t" $7]++} END{for(k in c) print k "\t" c[k]}' "$SITES" | sort | { if command -v column >/dev/null 2>&1; then column -t -s$'\t'; else cat; fi; }
+  log "sites.tsv: $(( $(wc -l < "$SITES") - 1 )) sites em ${#HOSTS[@]} hosts | $SITES"
+  exit 0
 fi
 
 # ---- relatorio ----
