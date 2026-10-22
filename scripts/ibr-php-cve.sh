@@ -723,7 +723,7 @@ enroll_flow() {
   local k pub h name ip port flag note alias target u ok vkey via=() n_ok=0 n_fail=0 n_skip=0 n_already=0
   k="${ENROLL_KEY:-$HOME/.ssh/ibr_ops_ed25519}"; k="${k/#\~/$HOME}"
   command -v ssh-copy-id >/dev/null 2>&1 || die "ssh-copy-id nao encontrado"
-  if [ ! -t 0 ] && [ -z "$ENROLL_VIA" ]; then die "enroll por senha exige terminal interativo (ou use --enroll-via CHAVE_QUE_JA_ENTRA)"; fi
+  if [ ! -t 0 ] && [ -z "$ENROLL_VIA" ] && [ "${#KEYMAP[@]}" -eq 0 ]; then die "enroll por senha exige terminal interativo (ou use --enroll-via / --keymap com chaves que ja entram)"; fi
   if [ ! -f "$k" ]; then
     echo "Gerando a chave dedicada $k (defina uma passphrase forte: ela da acesso a toda a frota)..."
     ssh-keygen -t ed25519 -C "ibr-ops@$(hostname -s)-$(date +%Y%m%d)" -f "$k" || die "falha ao gerar a chave"
