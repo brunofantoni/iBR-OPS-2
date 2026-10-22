@@ -735,7 +735,7 @@ if [ -n "$KEYMAP_FILE" ]; then
   done < "$KEYMAP_FILE"
 fi
 build_opts() {  # porta
-  OPTS=(-p "$1" -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=6
+  OPTS=(-p "$1" -o BatchMode=yes -o ConnectTimeout="${IBR_CONNECT_TIMEOUT:-8}" -o ServerAliveInterval=15 -o ServerAliveCountMax=6
         -o PasswordAuthentication=no -o StrictHostKeyChecking="$SHK" -o LogLevel=ERROR)
   if [ -n "$HOSTKEY" ]; then OPTS+=(-i "$HOSTKEY" -o IdentitiesOnly=yes); fi
   # enroll: ignora ~/.ssh/config (IdentityFile por host la dentro faria a chave ANTIGA passar no teste da nova)

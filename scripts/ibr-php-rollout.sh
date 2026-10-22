@@ -29,6 +29,8 @@
 #    --yes                  nao pede a confirmacao SIM
 #    --mitigate             (com --apply) aplica a mitigacao session.upload_progress=0 nos
 #                           hosts que ainda terao PHP sem correcao (NEEDS_BACKPORT / EOL)
+#    --no-patch             nao roda a fase de patch (so mitiga). Use enquanto o PHP for compilado pelo CWP:
+#                           o patch por pacote nao atualiza /opt/alt nem cwpphp.
 #    --canary HOST          host do canario (padrao: IBR-MAUTIC01 se estiver no plano)
 #    --only a,b             hosts (padrao: os 10 do ultimo scan, incluindo IBR-WEB008)
 #    --web008-backup-ok     libera IBR-WEB008 para escrita (por ultimo)
@@ -57,7 +59,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CVE="${IBR_CVE_SCRIPT:-$HERE/ibr-php-cve.sh}"
 DEFAULT_ONLY="IBR-WEB015,IBR-WEB008,IBR-MAUTIC01,HD1WEB1,GUIO002,CREA-AM,CRT-RJ-WEB-01,CRECI-DF-WEB-01,CRECI-DF-APP-01,WEB020"
 
-APPLY=0; YES=0; MITIGATE=0; CANARY=""; ONLY="$DEFAULT_ONLY"; WEB008_OK=0; IOC_OVR=""
+APPLY=0; YES=0; MITIGATE=0; NO_PATCH=0; CANARY=""; ONLY="$DEFAULT_ONLY"; WEB008_OK=0; IOC_OVR=""
 PRE_HOOK=""; NO_SNAP=0; OUT=""
 declare -a PASS=()
 
@@ -72,6 +74,7 @@ while [ $# -gt 0 ]; do
     --apply) APPLY=1 ;;
     --yes) YES=1 ;;
     --mitigate) MITIGATE=1 ;;
+    --no-patch) NO_PATCH=1 ;;
     --canary) CANARY="$2"; shift ;;
     --only) ONLY="$2"; shift ;;
     --web008-backup-ok) WEB008_OK=1 ;;
@@ -136,10 +139,8 @@ for h in $PATCHC; do
   if [ "$(lc "$h")" = "ibr-web008" ] && [ "$WEB008_OK" != 1 ]; then BLOCK_W008+=("$h"); continue; fi
   PATCH_SET+=("$h")
 done
-for h in $MITC; do
-  if [ "$(lc "$h")" = "ibr-web008" ] && [ "$WEB008_OK" != 1 ]; then continue; fi
-  MIT_SET+=("$h")
-done
+for h in $MITC; do MIT_SET+=("$h"); done
+if [ "$NO_PATCH" = 1 ]; then PATCH_SET=(); BLOCK_IOC=(); BLOCK_W008=(); fi
 
 # canario: o escolhido, senao IBR-MAUTIC01, senao o primeiro do plano
 CAN=""
@@ -200,13 +201,41 @@ if [ "$APPLY" = 1 ]; then
     fi
 
     if [ "$MITIGATE" = 1 ] && [ "${#MIT_SET[@]}" -gt 0 ]; then
-      log "fase 3a: mitigate em ${MIT_SET[*]}"
-      run_cve 3a-mitigate mitigate --apply --yes --keep-going --only "$(printf '%s\n' "${MIT_SET[@]}" | to_csv)"; rc=$?
+      # canario de mitigacao: GUIO002 se estiver no plano, senao o primeiro que nao seja WEB008; WEB008 por ultimo
+      MC=""; for h in "${MIT_SET[@]}"; do [ "$(lc "$h")" = "guio002" ] && MC="$h"; done
+      if [ -z "$MC" ]; then for h in "${MIT_SET[@]}"; do [ "$(lc "$h")" != "ibr-web008" ] && { MC="$h"; break; }; done; fi
+      [ -n "$MC" ] || MC="${MIT_SET[0]}"
+      MREST=(); MW=()
       for h in "${MIT_SET[@]}"; do
-        CHANGED+=("$h")
-        addres "$h" "$(grep -E '^MITIGATE\|(OK|NOOP|PARTIAL|FAILED)' "$OUT/3a-mitigate/raw/$h.txt" 2>/dev/null | tail -n1 | cut -c1-120)"
+        [ "$h" = "$MC" ] && continue
+        if [ "$(lc "$h")" = "ibr-web008" ]; then MW+=("$h"); else MREST+=("$h"); fi
       done
-      [ "$rc" -eq 0 ] || { STATUS=3; log "mitigate terminou com falha em algum host (rc=$rc); veja $OUT/3a-mitigate.log"; }
+      log "fase 3a: mitigate no CANARIO $MC"
+      run_cve 3a-mitigate-canario mitigate --apply --yes --only "$MC"; rc=$?
+      CHANGED+=("$MC")
+      addres "$MC" "$(grep -E '^MITIGATE\|(OK|NOOP|PARTIAL|FAILED)' "$OUT/3a-mitigate-canario/raw/$MC.txt" 2>/dev/null | tail -n1 | cut -c1-120)"
+      if [ "$rc" -ne 0 ] || ! grep -qE '^MITIGATE\|OK\|' "$OUT/3a-mitigate-canario/raw/$MC.txt" 2>/dev/null; then
+        STATUS=3; log "MITIGACAO NO CANARIO FALHOU em $MC: o restante NAO foi executado. Veja $OUT/3a-mitigate-canario.log"
+        MREST=(); MW=(); CAN=""; REST=(); W008=()
+      else
+        log "canario de mitigacao ok em $MC"
+      fi
+      if [ "${#MREST[@]}" -gt 0 ]; then
+        log "fase 3a2: mitigate em ${MREST[*]}"
+        run_cve 3a2-mitigate-resto mitigate --apply --yes --keep-going --only "$(printf '%s\n' "${MREST[@]}" | to_csv)"; rc=$?
+        for h in "${MREST[@]}"; do
+          CHANGED+=("$h")
+          addres "$h" "$(grep -E '^MITIGATE\|(OK|NOOP|PARTIAL|FAILED)' "$OUT/3a2-mitigate-resto/raw/$h.txt" 2>/dev/null | tail -n1 | cut -c1-120)"
+        done
+        [ "$rc" -eq 0 ] || { STATUS=3; log "mitigate terminou com falha em algum host (rc=$rc); veja $OUT/3a2-mitigate-resto.log"; }
+      fi
+      if [ "${#MW[@]}" -gt 0 ]; then
+        log "fase 3a3: mitigate em ${MW[*]} (por ultimo)"
+        run_cve 3a3-mitigate-web008 mitigate --apply --yes --only "${MW[0]}"; rc=$?
+        CHANGED+=("${MW[0]}")
+        addres "${MW[0]}" "$(grep -E '^MITIGATE\|(OK|NOOP|PARTIAL|FAILED)' "$OUT/3a3-mitigate-web008/raw/${MW[0]}.txt" 2>/dev/null | tail -n1 | cut -c1-120)"
+        [ "$rc" -eq 0 ] || STATUS=3
+      fi
     fi
 
     if [ -n "$CAN" ]; then
