@@ -39,7 +39,9 @@
 #                          Se falhar, o host e pulado.
 #    --no-snapshot         (patch) assume que voce aceita patch sem snapshot
 #    --keep-going          (mutacao) nao para na primeira falha
-#    --inventory FILE      inventario alternativo: NOME|IP|PORTA|FLAG|NOTA
+#    --inventory FILE      inventario alternativo: NOME|IP|PORTA|FLAG|NOTA|ALIAS
+#                          ALIAS (opcional) = nome DNS usado na conexao SSH, para casar com
+#                          ~/.ssh/config e known_hosts, que sao por nome e nao por IP.
 #    --out DIR             diretorio de saida
 #    --list                lista o inventario e sai
 #    -h, --help
@@ -83,9 +85,9 @@ usage() { sed -n '3,/^# =====/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 # ---------------------------------------------------------------------------
 inventory_builtin() {
 cat <<'IBR_INVENTORY'
-# NOME|IP|PORTA|FLAG|NOTA
-CREA-AM|177.234.159.43|22|run|
-IBR-WEB008|10.0.0.8|6650|explicit|hospeda o MySQL do IBR Ops (ibrops_aiops): patch por ultimo e com backup do banco
+# NOME|IP|PORTA|FLAG|NOTA|ALIAS
+CREA-AM|177.234.159.43|6650|run|porta 6650 e host crea-am-1 confirmados pelo Bruno (inventario dizia 22)|crea-am-1.ibrcloud.com.br
+IBR-WEB008|10.0.0.8|6650|explicit|hospeda o MySQL do IBR Ops (ibrops_aiops): patch por ultimo e com backup do banco|web008.ibrcloud.com.br
 IBR-ELASTICSEARCH|10.0.0.10|6650|run|
 IBR-GRAYLOG|10.0.0.20|6650|run|
 IBR-MYSQL001|10.0.0.30|6650|run|
@@ -104,7 +106,7 @@ CRECI-DF-AD-01|192.168.210.10|6650|skip|timeout na V5.3
 CRECI-DF-WEB-01|192.168.211.5|6650|run|
 CRECI-DF-APP-01|192.168.211.6|6650|run|
 CRECI-DF-DB-01|192.168.211.7|6650|run|
-WWW17-MTA1|192.99.229.6|6650|run|
+WWW17-MTA1|192.99.229.6|6650|run||www17.ibrcloud.com.br
 WEB020|10.110.0.20|6650|run|
 GUIO001|10.110.0.11|6650|run|
 GUIO002|10.110.0.12|6650|run|
@@ -581,7 +583,7 @@ load_inventory() {
 }
 
 if [ "$LIST_ONLY" = 1 ]; then
-  { echo "NOME|IP|PORTA|FLAG|NOTA"; load_inventory; } | column -t -s'|' 2>/dev/null || load_inventory
+  { echo "NOME|IP|PORTA|FLAG|NOTA|ALIAS"; load_inventory; } | column -t -s'|' 2>/dev/null || load_inventory
   exit 0
 fi
 
@@ -602,7 +604,7 @@ declare -a HOSTS=()
 only_lc=$(echo "$ONLY" | tr 'A-Z' 'a-z')
 declare -A FOUND=()
 while IFS= read -r line; do
-  IFS='|' read -r name ip port flag note <<<"$line"
+  IFS='|' read -r name ip port flag note alias <<<"$line"
   [ -n "$name" ] || continue
   lc=$(echo "$name" | tr 'A-Z' 'a-z')
   if [ -n "$only_lc" ]; then
@@ -613,7 +615,7 @@ while IFS= read -r line; do
       skip)     [ "$INC_SKIP" = 1 ] || continue ;;
     esac
   fi
-  HOSTS+=("$name|$ip|${port:-6650}|${flag:-run}|$note")
+  HOSTS+=("$name|$ip|${port:-6650}|${flag:-run}|$note|$alias")
 done < <(load_inventory)
 if [ -n "$only_lc" ]; then
   for n in ${only_lc//,/ }; do [ -n "${FOUND[$n]:-}" ] || echo "AVISO: '$n' nao existe no inventario" >&2; done
@@ -671,14 +673,15 @@ probe_access() {  # ip porta -> ACC_USER ACC_SUDO ACC_ERR
 }
 
 process_host() {
-  local line="$1" name ip port flag note raw
-  IFS='|' read -r name ip port flag note <<<"$line"
+  local line="$1" name ip port flag note alias target raw
+  IFS='|' read -r name ip port flag note alias <<<"$line"
+  target="${alias:-$ip}"
   raw="$OUT/raw/$name.txt"
   local lcn; lcn=$(echo "$name" | tr 'A-Z' 'a-z')
-  HOSTKEY="${KEYMAP[$lcn]:-${KEYMAP[$ip]:-$KEY}}"
-  if ! probe_access "$ip" "$port"; then
+  HOSTKEY="${KEYMAP[$lcn]:-${KEYMAP[$(echo "$target" | tr 'A-Z' 'a-z')]:-${KEYMAP[$ip]:-$KEY}}}"
+  if ! probe_access "$target" "$port"; then
     echo "FAIL|${ACC_ERR:-sem resposta}" > "$OUT/raw/$name.access"; : > "$raw"
-    log "$name ($ip:$port): SEM ACESSO - ${ACC_ERR:-sem resposta}"; return 2
+    log "$name ($target:$port): SEM ACESSO - ${ACC_ERR:-sem resposta}"; return 2
   fi
   echo "OK|$ACC_USER|$ACC_SUDO" > "$OUT/raw/$name.access"
   if [ "$MUTATING" = 1 ] && [ "$ACC_SUDO" = no ]; then
@@ -691,9 +694,9 @@ process_host() {
     fi
   fi
   local pre=""; [ "$ACC_SUDO" = yes ] && pre="sudo -n "
-  log "$name ($ip:$port) como $ACC_USER [sudo=$ACC_SUDO]: $MODE ..."
+  log "$name ($target:$port) como $ACC_USER [sudo=$ACC_SUDO]: $MODE ..."
   build_opts "$port"
-  remote_payload | timeout "$HOST_TIMEOUT" ssh "${OPTS[@]}" "$ACC_USER@$ip" \
+  remote_payload | timeout "$HOST_TIMEOUT" ssh "${OPTS[@]}" "$ACC_USER@$target" \
       "${pre}env IBR_MODE=$MODE IBR_SINCE=$SINCE bash -s" > "$raw" 2> "$raw.err"
   local rc=$?
   if [ $rc -ne 0 ] || ! grep -q '^DONE|' "$raw"; then
@@ -727,7 +730,7 @@ SUMMARY="$OUT/summary.tsv"; IOCF="$OUT/ioc.txt"
 printf 'HOST\tIP\tACESSO\tIP_PUBLICO\tPORTAS_WEB\tPHP_SERVINDO\tSTATUS_CVE\tSTALE\tIOC_ARQ_SUSPEITOS\tIOC_CRASHES\tIOC_PROCS\tMITIGACAO\tPATCH\n' > "$SUMMARY"
 : > "$IOCF"
 for h in "${HOSTS[@]}"; do
-  IFS='|' read -r name ip port flag note <<<"$h"
+  IFS='|' read -r name ip port flag note alias <<<"$h"
   raw="$OUT/raw/$name.txt"; acc="SEM_ARQUIVO"
   [ -f "$OUT/raw/$name.access" ] && acc=$(cut -d'|' -f1-3 "$OUT/raw/$name.access" | tr -cd '[:print:]' | tr '| ' ':_' | cut -c1-48)
   if [ "${acc%%:*}" != OK ]; then
