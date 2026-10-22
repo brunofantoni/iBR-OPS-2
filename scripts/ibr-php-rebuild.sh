@@ -113,6 +113,7 @@ swap)
   done
   [ -n "$FILES" ] || die "nada para trocar em $SP"
   EXIST=""; for r in $FILES; do [ -e "$P/$r" ] && EXIST="$EXIST ${P#/}/$r"; done
+  OLD_BROKEN=0; ldd "$P/sbin/php-fpm" 2>&1 | grep -q 'not found' && OLD_BROKEN=1
   tar -cf "$BK" -C / $EXIST || die "backup falhou"
   say "backup: $BK"
   restore() { tar -xf "$BK" -C / && say "backup restaurado"; }
@@ -129,7 +130,11 @@ swap)
   "$P/sbin/php-fpm" -v 2>&1 | head -1
   M=$(pgrep -f "php-fpm: master process \($P/etc/php-fpm.conf\)" | head -1)
   [ -n "$M" ] && echo "master $M exe=$(readlink -f /proc/$M/exe)"
-  say "rollback manual: tar -xf $BK -C / && systemctl reload $UNIT"
+  if [ "$OLD_BROKEN" = 1 ]; then
+    say "ATENCAO: o binario ANTIGO nao carrega (biblioteca ausente). NAO faca rollback: o reload derrubaria o php-fpm."
+  else
+    say "rollback manual: tar -xf $BK -C / && systemctl reload $UNIT"
+  fi
   ;;
 esac
 PAYLOAD_EOF
