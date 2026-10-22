@@ -274,6 +274,7 @@ scan_bins() {  # $1 = rotulo da fase
     case "$b" in
       /usr/*|/opt/*)
         own=$(stat -c %u "$b" 2>/dev/null); perm=$(stat -c %A "$b" 2>/dev/null)
+        case "$b" in /usr/local/cpanel/3rdparty/*) [ "$own" = 1 ] && own=0 ;; esac  # cPanel instala 3rdparty como bin:bin
         if [ "$own" = 0 ]; then case "$perm" in ?????w*|????????w*) ;; *) safe=yes ;; esac; fi ;;
     esac
     if [ "$safe" = no ] && [ -e "$b" ]; then emit IOC_BINPATH "$b" "binario PHP em caminho gravavel/nao-root: NAO executado"; fi
