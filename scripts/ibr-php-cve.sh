@@ -15,6 +15,9 @@
 #    mitigate    Mitigacao provisoria (session.upload_progress.enabled=0) via
 #                drop-in de ini + reload. NAO corrige o CVE.        [--apply]
 #    unmitigate  Remove o drop-in da mitigacao.                     [--apply]
+#    enroll      Cadastra uma chave SSH DEDICADA (padrao ~/.ssh/ibr_ops_ed25519, criada
+#                se nao existir) nos hosts que hoje recusam a sua chave, via ssh-copy-id
+#                (pede a senha de cada host, uma vez). Depois, use --key com ela.   [--apply]
 #    patch       Atualiza so os pacotes PHP (apt/dnf/yum), valida, reinicia o
 #                que ficou stale, testa HTTP local e faz rollback se piorar.
 #                                                                   [--apply]
@@ -28,6 +31,11 @@
 #    --canary              executa apenas no primeiro host selecionado
 #    --user U[,U2]         usuarios SSH em ordem (padrao: infrabrasil,ibrcloud)
 #    --key PATH            chave privada unica para todos (ou use ssh-agent)
+#    --enroll-key PATH     (enroll) chave a cadastrar (padrao ~/.ssh/ibr_ops_ed25519)
+#    --enroll-via PATH     (enroll) chave que JA entra no host, usada para instalar a nova;
+#                          o --keymap tem prioridade por host. Sem nenhuma, o ssh-copy-id usa
+#                          as chaves do agent e, so entao, pede a senha.
+#                          (necessario onde a senha esta desligada: so chave publica)
 #    --keymap FILE         chave por host: linhas NOME_OU_IP|/caminho/chave (prevalece sobre --key).
 #                          Necessario porque o ssh_config casa por NOME digitado, nao por IP.
 #    --trust-new-hostkeys  aceita host keys NOVAS (accept-new). Chave ALTERADA
@@ -69,6 +77,7 @@ APPLY=0; YES=0; ONLY=""; INC_EXPL=0; INC_SKIP=0; CANARY=0
 USERS="${IBR_SSH_USERS:-infrabrasil,ibrcloud}"
 KEY="${IBR_SSH_KEY:-}"
 KEYMAP_FILE=""
+ENROLL_KEY=""; ENROLL_VIA=""
 SHK="yes"
 SINCE="2026-10-17"
 PAR=6
@@ -118,7 +127,7 @@ GUIO007|10.110.0.17|6650|run|
 HD1WEB2C-NEW|192.99.229.4|6650|explicit|fingerprint SSH divergente: conferir por canal confiavel antes de qualquer coisa
 WEB021-PREVMOC|192.99.229.7|6650|run|
 IP-51-222-69-72|51.222.69.72|6650|run|
-IP-51-222-69-73|51.222.69.73|6650|explicit|falha de autenticacao na V5.3
+HD1WEB1|51.222.69.73|6650|explicit|= IP-51-222-69-73 do inventario; falha de autenticacao na V5.3
 IP-51-222-69-74|51.222.69.74|6650|run|
 IP-51-222-69-75|51.222.69.75|6650|run|so chave publica
 IP-51-222-69-76|51.222.69.76|6650|run|so chave publica
@@ -551,7 +560,7 @@ IBR_REMOTE_PAYLOAD
 die() { echo "ERRO: $*" >&2; exit 1; }
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
 
-[ $# -gt 0 ] && case "$1" in discover|mitigate|unmitigate|patch) MODE="$1"; shift ;; esac
+[ $# -gt 0 ] && case "$1" in discover|mitigate|unmitigate|patch|enroll) MODE="$1"; shift ;; esac
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
@@ -563,6 +572,8 @@ while [ $# -gt 0 ]; do
     --user|--users) USERS="$2"; shift ;;
     --key) KEY="$2"; shift ;;
     --keymap) KEYMAP_FILE="$2"; shift ;;
+    --enroll-key) ENROLL_KEY="$2"; shift ;;
+    --enroll-via) ENROLL_VIA="$2"; shift ;;
     --trust-new-hostkeys) SHK="accept-new" ;;
     --since) SINCE="$2"; shift ;;
     --parallel) PAR="$2"; shift ;;
@@ -591,7 +602,7 @@ OUT="${OUT:-./php-cve-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT/raw" || die "nao consegui criar $OUT"
 : > "$OUT/run.log"
 
-MUTATING=0; case "$MODE" in mitigate|unmitigate|patch) MUTATING=1 ;; esac
+MUTATING=0; case "$MODE" in mitigate|unmitigate|patch|enroll) MUTATING=1 ;; esac
 if [ "$MUTATING" = 1 ] && [ "$APPLY" != 1 ]; then die "modo '$MODE' altera servidores: exige --apply"; fi
 if [ "$MODE" = patch ] && [ -z "$PRE_HOOK" ] && [ "$NO_SNAP" != 1 ]; then
   die "patch exige --pre-hook (snapshot) ou --no-snapshot (voce assume o risco)"
@@ -651,7 +662,7 @@ build_opts() {  # porta
 clean_msg() { tr -d '\r' | tr -cd '[:print:]\n' | grep -v '^[[:space:]]*$' | tail -n1 | cut -c1-110; }
 probe_access() {  # ip porta -> ACC_USER ACC_SUDO ACC_ERR
   local u out rc msg
-  ACC_USER=""; ACC_SUDO=""; ACC_ERR=""
+  ACC_USER=""; ACC_SUDO=""; ACC_ERR=""; ACC_KIND="other"
   build_opts "$2"
   for u in ${USERS//,/ }; do
     out=$(ssh -n "${OPTS[@]}" "$u@$1" 'if [ "$(id -u)" = 0 ]; then echo SUDO=root; elif sudo -n true 2>/dev/null; then echo SUDO=yes; else echo SUDO=no; fi' 2>&1); rc=$?
@@ -660,9 +671,10 @@ probe_access() {  # ip porta -> ACC_USER ACC_SUDO ACC_ERR
     fi
     msg=$(clean_msg <<<"$out")
     case "$out" in
-      *"IDENTIFICATION HAS CHANGED"*) msg="CHAVE DO HOST ALTERADA: nao conectar, verificar por canal confiavel" ;;
-      *"host key is known"*|*"Host key verification failed"*) msg="host key ausente no known_hosts para este IP:porta (use --trust-new-hostkeys)" ;;
-      *"Permission denied"*) msg="$u: chave nao autorizada (metodos: $(grep -o '(.*)' <<<"$out" | tr -cd '[:print:]' | head -n1))" ;;
+      *"IDENTIFICATION HAS CHANGED"*) ACC_KIND=changed; msg="CHAVE DO HOST ALTERADA: nao conectar, verificar por canal confiavel" ;;
+      *"host key is known"*|*"Host key verification failed"*) ACC_KIND=hostkey; msg="host key ausente no known_hosts para este IP:porta (use --trust-new-hostkeys)" ;;
+      *"timed out"*|*"No route"*|*"refused"*|*"Could not resolve"*) ACC_KIND=net ;;
+      *"Permission denied"*) ACC_KIND=denied; msg="$u: chave nao autorizada (metodos: $(grep -o '(.*)' <<<"$out" | tr -cd '[:print:]' | head -n1))" ;;
     esac
     ACC_ERR="${ACC_ERR:+$ACC_ERR; }$msg"
     case "$out" in
@@ -706,6 +718,46 @@ process_host() {
   log "$name: concluido"
   return 0
 }
+
+enroll_flow() {
+  local k pub h name ip port flag note alias target u ok vkey via=() n_ok=0 n_fail=0 n_skip=0 n_already=0
+  k="${ENROLL_KEY:-$HOME/.ssh/ibr_ops_ed25519}"; k="${k/#\~/$HOME}"
+  command -v ssh-copy-id >/dev/null 2>&1 || die "ssh-copy-id nao encontrado"
+  if [ ! -t 0 ] && [ -z "$ENROLL_VIA" ]; then die "enroll por senha exige terminal interativo (ou use --enroll-via CHAVE_QUE_JA_ENTRA)"; fi
+  if [ ! -f "$k" ]; then
+    echo "Gerando a chave dedicada $k (defina uma passphrase forte: ela da acesso a toda a frota)..."
+    ssh-keygen -t ed25519 -C "ibr-ops@$(hostname -s)-$(date +%Y%m%d)" -f "$k" || die "falha ao gerar a chave"
+  fi
+  [ -f "$k.pub" ] || ssh-keygen -y -f "$k" > "$k.pub" || die "sem chave publica"
+  ssh-add "$k" 2>/dev/null || true
+  pub="$k.pub"
+  log "enroll: cadastrando $(ssh-keygen -lf "$pub" | cut -d' ' -f1-2) | usuarios: $USERS"
+  for h in "${HOSTS[@]}"; do
+    IFS='|' read -r name ip port flag note alias <<<"$h"
+    target="${alias:-$ip}"; HOSTKEY="$k"
+    if probe_access "$target" "$port"; then log "$name: ja aceita a chave (nada a fazer)"; n_already=$((n_already+1)); continue; fi
+    if [ "$ACC_KIND" != denied ]; then log "$name: PULADO - $ACC_ERR"; n_skip=$((n_skip+1)); continue; fi
+    ok=0; via=()
+    vkey="${KEYMAP[$(echo "$name" | tr 'A-Z' 'a-z')]:-${KEYMAP[$(echo "$target" | tr 'A-Z' 'a-z')]:-$ENROLL_VIA}}"
+    if [ -n "$vkey" ]; then via=(-o "IdentityFile=${vkey/#\~/$HOME}" -o IdentitiesOnly=yes); fi
+    for u in ${USERS//,/ }; do
+      log "$name ($target:$port): instalando a chave para o usuario $u ..."
+      ssh-copy-id -i "$pub" -p "$port" -o StrictHostKeyChecking="$SHK" -o ConnectTimeout=8 -o NumberOfPasswordPrompts=1 "${via[@]}" "$u@$target"
+      if probe_access "$target" "$port"; then log "$name: ENROLADO como $ACC_USER [sudo=$ACC_SUDO]"; ok=1; n_ok=$((n_ok+1)); break; fi
+    done
+    if [ "$ok" = 0 ]; then
+      log "$name: FALHOU - se o host so aceita chave publica, use --enroll-via com uma chave que ja entra, ou o console do provedor"
+      n_fail=$((n_fail+1))
+    fi
+  done
+  log "ENROLL: ok=$n_ok ja_ok=$n_already falhou=$n_fail pulado=$n_skip"
+  echo "Proximo passo: $0 discover --key $k"
+  echo "Revogar depois: nos hosts, remova de ~/.ssh/authorized_keys a linha com o comentario '$(awk '{print $3}' "$pub")'"
+  [ "$n_fail" -eq 0 ] || exit 3
+  exit 0
+}
+
+if [ "$MODE" = enroll ]; then enroll_flow; fi
 
 STATUS=0
 if [ "$MUTATING" = 1 ]; then
