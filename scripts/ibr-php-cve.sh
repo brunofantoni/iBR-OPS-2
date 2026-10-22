@@ -954,5 +954,5 @@ case "$MODE" in
   mitigate) echo "Mitigacao e provisoria e NAO corrige o CVE. Faca o patch e depois 'unmitigate'." ;;
 esac
 [ "$STATUS" -ne 0 ] && exit "$STATUS"
-{ [ "$n_vuln" -gt 0 ] || [ "$n_ioc" -gt 0 ]; } && exit 2
+if [ "$MODE" = discover ] && { [ "$n_vuln" -gt 0 ] || [ "$n_ioc" -gt 0 ]; }; then exit 2; fi
 exit 0
