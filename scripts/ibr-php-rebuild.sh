@@ -60,7 +60,10 @@ LOG=$WORK/build.log; ST=$WORK/STATUS; P=$PHPDIR/usr
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 case "$MODE" in
 build)
-  mkdir -p "$WORK"; : > "$LOG"; echo RUNNING > "$ST"
+  mkdir -p "$WORK"
+  exec 9>"$WORK/.lock"
+  flock -n 9 || { echo "build ja em andamento para $NAME-$VER (aguarde ou use status)"; exit 1; }
+  : > "$LOG"; echo RUNNING > "$ST"
   exec >> "$LOG" 2>&1
   fail() { echo "FAIL $*" > "$ST"; echo "FALHA: $*"; exit 1; }
   [ -x "$P/bin/php-config" ] || fail "php-config ausente em $P/bin"
@@ -96,6 +99,7 @@ build)
   ;;
 status)
   echo "STATUS: $(cat "$ST" 2>/dev/null || echo SEM_BUILD)"
+  if [ -e "$WORK/.lock" ]; then ( exec 9>"$WORK/.lock"; flock -n 9 && echo "processo de build ativo: nao" || echo "processo de build ativo: SIM" ); fi
   tail -n 15 "$LOG" 2>/dev/null
   ;;
 swap)
@@ -142,8 +146,11 @@ PAYLOAD_EOF
 case "$MODE" in
   build)
     log "ibr-php-rebuild v$VERSION | build php $PV em $HOST:$DIR (staging; producao NAO e alterada)"
-    "${SSH[@]}" "sudo mkdir -p /opt/ibr-build && sudo tee /opt/ibr-build/payload.sh >/dev/null" <<<"$PAYLOAD" || die "nao consegui enviar o payload"
-    "${SSH[@]}" "sudo -n env $ENVV IBR_MODE=build setsid nohup bash /opt/ibr-build/payload.sh >/dev/null 2>&1 </dev/null &" || die "nao consegui iniciar o build"
+    TGT="$(basename "$DIR")-$PV"
+    BUSY=$("${SSH[@]}" "sudo bash -c 'mkdir -p /opt/ibr-build/$TGT && exec 9>/opt/ibr-build/$TGT/.lock && { flock -n 9 && echo FREE || echo BUSY; }'" 2>/dev/null)
+    [ "$BUSY" = FREE ] || die "ja existe um build em andamento para $TGT em $HOST (ou o host nao respondeu: '$BUSY'). Use: status"
+    "${SSH[@]}" "sudo mkdir -p /opt/ibr-build && sudo tee /opt/ibr-build/payload.$TGT.sh >/dev/null" <<<"$PAYLOAD" || die "nao consegui enviar o payload"
+    "${SSH[@]}" "sudo -n env $ENVV IBR_MODE=build setsid nohup bash /opt/ibr-build/payload.$TGT.sh >/dev/null 2>&1 </dev/null &" || die "nao consegui iniciar o build"
     log "build iniciado em segundo plano. Acompanhando (Ctrl-C nao interrompe o build; use 'status' depois)."
     sleep 10
     while :; do
@@ -159,6 +166,7 @@ case "$MODE" in
       echo "Vai trocar os binarios de $DIR em $HOST por PHP $PV e RECARREGAR o php-fpm (graceful)."
       read -r -p "Digite SIM para continuar: " ans; [ "$ans" = "SIM" ] || die "cancelado"
     fi
-    "${SSH[@]}" "sudo mkdir -p /opt/ibr-build && sudo tee /opt/ibr-build/payload.sh >/dev/null" <<<"$PAYLOAD" || die "nao consegui enviar o payload"
-    "${SSH[@]}" "sudo -n env $ENVV IBR_MODE=$MODE bash /opt/ibr-build/payload.sh" ;;
+    TGT="$(basename "$DIR")-$PV"
+    "${SSH[@]}" "sudo mkdir -p /opt/ibr-build && sudo tee /opt/ibr-build/payload.$TGT.sh >/dev/null" <<<"$PAYLOAD" || die "nao consegui enviar o payload"
+    "${SSH[@]}" "sudo -n env $ENVV IBR_MODE=$MODE bash /opt/ibr-build/payload.$TGT.sh" ;;
 esac
