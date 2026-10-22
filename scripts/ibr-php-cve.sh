@@ -96,7 +96,7 @@ inventory_builtin() {
 cat <<'IBR_INVENTORY'
 # NOME|IP|PORTA|FLAG|NOTA|ALIAS
 CREA-AM|177.234.159.43|6650|run|porta 6650 e host crea-am-1 confirmados pelo Bruno (inventario dizia 22)|crea-am-1.ibrcloud.com.br
-IBR-WEB008|10.0.0.8|6650|explicit|hospeda o MySQL do IBR Ops (ibrops_aiops): patch por ultimo e com backup do banco|web008.ibrcloud.com.br
+IBR-WEB008|10.0.0.8|6650|explicit|hospeda o MySQL do IBR Ops (ibrops_aiops): patch por ultimo e com backup do banco. Sem alias: web008.ibrcloud.com.br resolve para outro endereco (timeout)|
 IBR-ELASTICSEARCH|10.0.0.10|6650|run|
 IBR-GRAYLOG|10.0.0.20|6650|run|
 IBR-MYSQL001|10.0.0.30|6650|run|
